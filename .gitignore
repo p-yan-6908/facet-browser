@@ -1,0 +1,5 @@
+# Build intermediates (the finished bundle is committed; these are not)
+build/
+*.o
+*.swiftmodule
+.DS_Store

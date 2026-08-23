@@ -1,0 +1,10 @@
+#!/bin/bash
+# Report real memory footprint (the number Activity Monitor shows) for browsers.
+#   ./tools/kmem                       -> Kestrel, Chrome, Safari
+#   ./tools/kmem Kestrel "Google Chrome"
+set -euo pipefail
+cd "$(dirname "$0")/.."
+mkdir -p build
+[ build/memreport -nt tools/memreport.swift ] 2>/dev/null || \
+  swiftc -O -swift-version 5 -o build/memreport tools/memreport.swift
+exec ./build/memreport "$@"
