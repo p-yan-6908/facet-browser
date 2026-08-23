@@ -38,7 +38,32 @@ enum MemoryMonitor {
         return raw.load(as: rusage_info_v4.self).ri_phys_footprint
     }
 
+    /// Executable paths never change for a live pid, so cache them. Without this the
+    /// readout called proc_pidpath on every process on the machine on every tick, which
+    /// cost around 1% of a core continuously -- more than the browser itself used.
+    private static var pathCache: [pid_t: String] = [:]
+    private static var pathCacheStamp = Date()
+
+    /// Returns true only for WebKit helper executables, memoised per pid.
+    private static func isWebKitHelper(_ pid: pid_t, buffer: UnsafeMutablePointer<CChar>) -> Bool {
+        if let hit = pathCache[pid] { return hit == "1" }
+        buffer[0] = 0
+        var verdict = false
+        if proc_pidpath(pid, buffer, 4096) > 0 {
+            let path = String(cString: buffer)
+            verdict = path.contains("WebKit.framework") || path.contains("com.apple.WebKit")
+        }
+        if pathCache.count < 4096 { pathCache[pid] = verdict ? "1" : "0" }
+        return verdict
+    }
+
     static func sample() -> MemorySample {
+        // pids are eventually reused, so drop the cache periodically rather than trusting
+        // it forever.
+        if Date().timeIntervalSince(pathCacheStamp) > 300 {
+            pathCache.removeAll(keepingCapacity: true)
+            pathCacheStamp = Date()
+        }
         var s = MemorySample()
         let me = getpid()
         // Normally WebKit's XPC helpers are attributed straight to us. When Kestrel is
@@ -61,10 +86,7 @@ enum MemoryMonitor {
         defer { pathBuf.deallocate() }
 
         for pid in pids where pid > 0 && pid != me {
-            pathBuf[0] = 0
-            guard proc_pidpath(pid, pathBuf, 4096) > 0 else { continue }
-            let path = String(cString: pathBuf)
-            guard path.contains("WebKit.framework") || path.contains("com.apple.WebKit") else { continue }
+            guard isWebKitHelper(pid, buffer: pathBuf) else { continue }
             guard accepted.contains(responsibility_get_pid_responsible_for_pid(pid)) else { continue }
             let f = footprint(of: pid)
             guard f > 0 else { continue }

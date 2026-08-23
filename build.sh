@@ -10,7 +10,7 @@ VERSION="1.0"
 DEST="${1:-.}"
 
 echo "==> Compiling ($(ls Sources/*.swift | wc -l | tr -d ' ') files)"
-rm -rf build "$APP"
+rm -rf "$APP"
 mkdir -p build "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 swiftc \

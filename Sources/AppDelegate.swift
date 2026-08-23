@@ -5,6 +5,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     static var shared: AppDelegate?
 
     private var controllers: [BrowserWindowController] = []
+    /// URLs can arrive from LaunchServices before the first window exists (clicking a
+    /// link while Kestrel is closed), so hold them until the window is up.
+    private var isReady = false
+    private var pendingURLs: [URL] = []
     private let bookmarksMenu = NSMenu(title: "Bookmarks")
     private let historyMenu = NSMenu(title: "History")
 
@@ -37,9 +41,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if sleeping > 0 {
                 c.showStatus("Restored \(session.tabs.count) tabs, \(sleeping) asleep")
             }
-        } else {
+        }
+        if !pendingURLs.isEmpty {
+            // Open every URL, but focus the first, like Safari and Chrome do. Focusing
+            // the last would leave whichever page happened to be at the end of the list
+            // running in the foreground.
+            let firstNew = c.tabs.count
+            for u in pendingURLs {
+                let tab = c.newTab(url: u, activate: false)
+                tab.ensureLoaded()   // explicitly requested by the user, so load it now
+            }
+            pendingURLs.removeAll()
+            c.selectTab(index: firstNew)
+        } else if c.tabs.isEmpty {
             c.newTab()
         }
+        isReady = true
         rebuildBookmarksMenu()
     }
 
@@ -74,6 +91,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Links opened from other apps (and from being the default browser).
     func application(_ application: NSApplication, open urls: [URL]) {
+        guard isReady else { pendingURLs.append(contentsOf: urls); return }
         let c = front ?? makeWindow()
         for u in urls { c.newTab(url: u) }
         c.window?.makeKeyAndOrderFront(nil)
@@ -85,6 +103,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func newWindow() { makeWindow().newTab() }
     @objc func newPrivateWindow() { makeWindow(isPrivate: true).newTab() }
     @objc func closeTab() { front?.closeActiveTab() }
+    @objc func reopenClosedTab() { front?.reopenClosedTab() }
     @objc func focusAddressBar() { front?.focusURLField() }
     @objc func reload() { front?.reload() }
     @objc func goBack() { front?.goBack() }
@@ -263,6 +282,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add(file, "Open Location\u{2026}", #selector(focusAddressBar), "l", target: self)
         file.addItem(.separator())
         add(file, "Close Tab", #selector(closeTab), "w", target: self)
+        add(file, "Reopen Closed Tab", #selector(reopenClosedTab), "t", [.command, .shift], target: self)
         add(file, "Close Window", #selector(NSWindow.performClose(_:)), "w", [.command, .shift])
         file.addItem(.separator())
         add(file, "Open Downloads Folder", #selector(openDownloadsFolder), "j", [.command, .shift], target: self)

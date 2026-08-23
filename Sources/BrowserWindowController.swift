@@ -18,17 +18,24 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     private let webContainer = FlippedView()
     private let startView = StartView()
 
-    private let backButton = NSButton()
-    private let forwardButton = NSButton()
-    private let reloadButton = NSButton()
-    private let shieldButton = NSButton()
-    private let bookmarkButton = NSButton()
-    private let urlField = URLField()
-    private let statusLabel = NSTextField(labelWithString: "")
+    private let chromeBackground = NSVisualEffectView()
+    private let hairline = HairlineView()
 
-    private let findRow = FlippedView()
+    private var backButton: ToolbarButton!
+    private var forwardButton: ToolbarButton!
+    private var reloadButton: ToolbarButton!
+    private var shieldButton: ToolbarButton!
+    private var bookmarkButton: ToolbarButton!
+    private let urlBar = URLBar()
+    private var urlField: URLField { urlBar.field }
+    private let statusPill = StatusPill()
+
+    private let findRow = BarBackgroundView()
     private let findField = NSTextField()
     private let findCount = NSTextField(labelWithString: "")
+    private var findPrevButton: ToolbarButton!
+    private var findNextButton: ToolbarButton!
+    private let findDoneButton = NSButton()
     private var findVisible = false
 
     private var hibernationTimer: Timer?
@@ -37,6 +44,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     private var sessionSaveScheduled = false
     private var suppressCompletion = false
     private var statusResetWork: DispatchWorkItem?
+    /// Most recently closed tabs, for Reopen Closed Tab.
+    private var closedTabs: [SavedTab] = []
 
     private let chromeTopHeight: CGFloat = 36 + 38
     private var findRowHeight: CGFloat { findVisible ? 34 : 0 }
@@ -61,6 +70,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         w.tabbingMode = .disallowed          // we manage our own tabs
         w.setFrameAutosaveName(isPrivate ? "KestrelPrivateWindow" : "KestrelWindow")
         w.backgroundColor = .windowBackgroundColor
+        if #available(macOS 11.0, *) { w.titlebarSeparatorStyle = .none }
 
         buildChrome()
         w.contentView = root
@@ -77,49 +87,49 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     // MARK: - Chrome
 
     private func buildChrome() {
+        // One vibrant layer behind the whole chrome gives the standard native toolbar
+        // look for the cost of a single layer.
+        chromeBackground.material = .titlebar
+        chromeBackground.blendingMode = .withinWindow
+        chromeBackground.state = .followsWindowActiveState
+        root.addSubview(chromeBackground)
+
         root.addSubview(tabStrip)
         root.addSubview(toolbarRow)
         root.addSubview(progressBar)
         root.addSubview(findRow)
+        root.addSubview(hairline)
         root.addSubview(webContainer)
 
         tabStrip.delegate = self
         progressBar.active = false
         findRow.isHidden = true
 
-        func setup(_ b: NSButton, _ symbol: String, _ tip: String, _ action: Selector) {
-            b.bezelStyle = .accessoryBarAction
-            b.isBordered = false
-            b.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tip)
-            b.imageScaling = .scaleProportionallyDown
-            b.target = self
-            b.action = action
-            b.toolTip = tip
-            b.contentTintColor = .secondaryLabelColor
-        }
+        backButton = ToolbarButton(symbol: "chevron.backward", tip: "Back (\u{2318}[)",
+                                   target: self, action: #selector(goBack))
+        forwardButton = ToolbarButton(symbol: "chevron.forward", tip: "Forward (\u{2318}])",
+                                      target: self, action: #selector(goForward))
+        reloadButton = ToolbarButton(symbol: "arrow.clockwise", tip: "Reload (\u{2318}R)",
+                                     target: self, action: #selector(reloadOrStop))
+        bookmarkButton = ToolbarButton(symbol: "star", tip: "Bookmark (\u{2318}D)",
+                                       target: self, action: #selector(toggleBookmark))
+        bookmarkButton.onTint = .systemYellow
+        shieldButton = ToolbarButton(symbol: "shield.lefthalf.filled",
+                                     tip: "Ad & tracker blocking",
+                                     target: self, action: #selector(toggleBlocking))
 
-        setup(backButton, "chevron.left", "Back (\u{2318}[)", #selector(goBack))
-        setup(forwardButton, "chevron.right", "Forward (\u{2318}])", #selector(goForward))
-        setup(reloadButton, "arrow.clockwise", "Reload (\u{2318}R)", #selector(reloadOrStop))
-        setup(shieldButton, "shield.lefthalf.filled", "Ad & tracker blocking", #selector(toggleBlocking))
-        setup(bookmarkButton, "star", "Bookmark (\u{2318}D)", #selector(toggleBookmark))
-
-        urlField.placeholderString = "Search or enter address"
-        urlField.font = .systemFont(ofSize: 13)
-        urlField.bezelStyle = .roundedBezel
-        urlField.focusRingType = .none
         urlField.delegate = self
         urlField.target = self
         urlField.action = #selector(urlFieldCommitted)
-        urlField.onCancel = { [weak self] in self?.focusWebContent() }
+        urlField.onCancel = { [weak self] in
+            guard let self else { return }
+            self.urlField.stringValue = self.activeTab?.url
+                .map { Store.displayForm($0.absoluteString) } ?? ""
+            self.focusWebContent()
+        }
 
-        statusLabel.font = .systemFont(ofSize: 11)
-        statusLabel.textColor = .tertiaryLabelColor
-        statusLabel.alignment = .right
-        statusLabel.lineBreakMode = .byTruncatingHead
-
-        [backButton, forwardButton, reloadButton, urlField, bookmarkButton,
-         shieldButton, statusLabel].forEach { toolbarRow.addSubview($0) }
+        [backButton, forwardButton, reloadButton, urlBar, bookmarkButton,
+         shieldButton, statusPill].forEach { toolbarRow.addSubview($0!) }
 
         // Find bar
         findField.placeholderString = "Find on page"
@@ -128,14 +138,18 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         findField.target = self
         findField.action = #selector(findNext)
         findCount.font = .systemFont(ofSize: 11)
-        findCount.textColor = .tertiaryLabelColor
-        let prev = NSButton(title: "", target: self, action: #selector(findPrevious))
-        prev.image = NSImage(systemSymbolName: "chevron.up", accessibilityDescription: "Previous")
-        let next = NSButton(title: "", target: self, action: #selector(findNext))
-        next.image = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: "Next")
-        let done = NSButton(title: "Done", target: self, action: #selector(hideFindBar))
-        [prev, next, done].forEach { $0.bezelStyle = .accessoryBarAction; $0.isBordered = false }
-        [findField, prev, next, findCount, done].forEach { findRow.addSubview($0) }
+        findCount.textColor = .secondaryLabelColor
+        findPrevButton = ToolbarButton(symbol: "chevron.up", tip: "Previous (\u{2318}\u{21E7}G)",
+                                       target: self, action: #selector(findPrevious), pointSize: 11)
+        findNextButton = ToolbarButton(symbol: "chevron.down", tip: "Next (\u{2318}G)",
+                                       target: self, action: #selector(findNext), pointSize: 11)
+        findDoneButton.title = "Done"
+        findDoneButton.bezelStyle = .rounded
+        findDoneButton.controlSize = .small
+        findDoneButton.target = self
+        findDoneButton.action = #selector(hideFindBar)
+        [findField, findPrevButton, findNextButton, findCount, findDoneButton]
+            .forEach { findRow.addSubview($0!) }
 
         startView.onOpen = { [weak self] urlString in
             guard let self, let u = URL(string: urlString) else { return }
@@ -149,53 +163,61 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
 
     private func layoutChrome() {
         let b = root.bounds
-        let trafficLightInset: CGFloat = 78
+        let trafficLightInset: CGFloat = 82
+        let tabRow: CGFloat = 36
+        let toolRow: CGFloat = 40
+
         tabStrip.frame = NSRect(x: trafficLightInset, y: 0,
-                                width: max(0, b.width - trafficLightInset), height: 36)
-        toolbarRow.frame = NSRect(x: 0, y: 36, width: b.width, height: 38)
-        progressBar.frame = NSRect(x: 0, y: chromeTopHeight - 2, width: b.width, height: 2)
+                                width: max(0, b.width - trafficLightInset), height: tabRow)
+        toolbarRow.frame = NSRect(x: 0, y: tabRow, width: b.width, height: toolRow)
+        progressBar.frame = NSRect(x: 0, y: chromeTopHeight - 3, width: b.width, height: 3)
 
         findRow.frame = NSRect(x: 0, y: chromeTopHeight, width: b.width, height: findRowHeight)
         findRow.isHidden = !findVisible
-        let webY = chromeTopHeight + findRowHeight
-        webContainer.frame = NSRect(x: 0, y: webY, width: b.width, height: max(0, b.height - webY))
+
+        let chromeBottom = chromeTopHeight + findRowHeight
+        chromeBackground.frame = NSRect(x: 0, y: 0, width: b.width, height: chromeBottom)
+        hairline.frame = NSRect(x: 0, y: chromeBottom - 1, width: b.width, height: 1)
+
+        webContainer.frame = NSRect(x: 0, y: chromeBottom, width: b.width,
+                                    height: max(0, b.height - chromeBottom))
         startView.frame = webContainer.bounds
         activeTab?.webView?.frame = webContainer.bounds
 
-        // Toolbar row internals
-        let y: CGFloat = 7
-        let h: CGFloat = 24
-        backButton.frame = NSRect(x: 10, y: y, width: 26, height: h)
-        forwardButton.frame = NSRect(x: 38, y: y, width: 26, height: h)
-        reloadButton.frame = NSRect(x: 68, y: y, width: 26, height: h)
+        // Toolbar row internals. Buttons get a 30x28 hit area so the hover highlight
+        // reads as a real target rather than a tight box around the glyph.
+        let bw: CGFloat = 30, bh: CGFloat = 28
+        let y = (toolRow - bh) / 2
+        backButton.frame = NSRect(x: 12, y: y, width: bw, height: bh)
+        forwardButton.frame = NSRect(x: 44, y: y, width: bw, height: bh)
+        reloadButton.frame = NSRect(x: 78, y: y, width: bw, height: bh)
 
         var right = b.width - 12
         if Config.shared.showMemoryReadout {
-            statusLabel.isHidden = false
-            let w: CGFloat = 128
-            statusLabel.frame = NSRect(x: right - w, y: 9, width: w, height: 16)
-            right -= w + 6
+            statusPill.isHidden = false
+            let w = max(64, min(190, statusPill.fittingWidth))
+            statusPill.frame = NSRect(x: right - w, y: 0, width: w, height: toolRow)
+            right -= w + 4
         } else {
-            statusLabel.isHidden = true
+            statusPill.isHidden = true
         }
-        shieldButton.frame = NSRect(x: right - 26, y: y, width: 26, height: h)
-        right -= 28
-        bookmarkButton.frame = NSRect(x: right - 26, y: y, width: 26, height: h)
-        right -= 30
+        shieldButton.frame = NSRect(x: right - bw, y: y, width: bw, height: bh)
+        right -= bw + 2
+        bookmarkButton.frame = NSRect(x: right - bw, y: y, width: bw, height: bh)
+        right -= bw + 8
 
-        let urlX: CGFloat = 102
-        urlField.frame = NSRect(x: urlX, y: 6, width: max(80, right - urlX), height: 25)
+        let urlX: CGFloat = 116
+        let fieldH: CGFloat = 28
+        urlBar.frame = NSRect(x: urlX, y: (toolRow - fieldH) / 2,
+                              width: max(90, right - urlX), height: fieldH)
 
         // Find row internals
         if findVisible {
-            findField.frame = NSRect(x: 12, y: 5, width: 260, height: 24)
-            let subs = findRow.subviews.compactMap { $0 as? NSButton }
-            if subs.count >= 3 {
-                subs[0].frame = NSRect(x: 280, y: 6, width: 24, height: 22)
-                subs[1].frame = NSRect(x: 306, y: 6, width: 24, height: 22)
-                subs[2].frame = NSRect(x: b.width - 70, y: 6, width: 58, height: 22)
-            }
-            findCount.frame = NSRect(x: 338, y: 8, width: 160, height: 16)
+            findField.frame = NSRect(x: 14, y: 5, width: 250, height: 24)
+            findPrevButton.frame = NSRect(x: 272, y: 5, width: 26, height: 24)
+            findNextButton.frame = NSRect(x: 300, y: 5, width: 26, height: 24)
+            findCount.frame = NSRect(x: 334, y: 9, width: 200, height: 16)
+            findDoneButton.frame = NSRect(x: b.width - 78, y: 5, width: 64, height: 24)
         }
     }
 
@@ -259,6 +281,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     func closeTab(index: Int) {
         guard tabs.indices.contains(index) else { return }
         let tab = tabs[index]
+        if tab.url != nil, !isPrivateWindow {
+            closedTabs.append(tab.snapshot())
+            if closedTabs.count > 10 { closedTabs.removeFirst() }
+        }
         tab.webView?.removeFromSuperview()
         tab.hibernate()
         tabs.remove(at: index)
@@ -275,6 +301,20 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func closeActiveTab() { closeTab(index: activeIndex) }
+
+    /// Restores the last closed tab with its history and scroll position intact.
+    @objc func reopenClosedTab() {
+        guard let saved = closedTabs.popLast() else {
+            showStatus("No recently closed tabs")
+            return
+        }
+        let tab = Tab(saved: saved, delegate: self)
+        tabs.append(tab)
+        activeIndex = tabs.count - 1
+        attachActiveTab()
+        refreshChrome()
+        scheduleSessionSave()
+    }
 
     /// Swap the visible web view. Waking a hibernated tab happens here.
     private func attachActiveTab() {
@@ -309,13 +349,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         tabStrip.update(tabs: tabs, selected: activeIndex)
 
         guard let tab = activeTab else { return }
+        // ToolbarButton handles its own enabled/disabled tinting.
         backButton.isEnabled = tab.canGoBack
         forwardButton.isEnabled = tab.canGoForward
-        backButton.contentTintColor = tab.canGoBack ? .secondaryLabelColor : .quaternaryLabelColor
-        forwardButton.contentTintColor = tab.canGoForward ? .secondaryLabelColor : .quaternaryLabelColor
 
-        reloadButton.image = NSImage(systemSymbolName: tab.isLoading ? "xmark" : "arrow.clockwise",
-                                     accessibilityDescription: tab.isLoading ? "Stop" : "Reload")
+        reloadButton.setSymbol(tab.isLoading ? "xmark" : "arrow.clockwise")
+        reloadButton.toolTip = tab.isLoading ? "Stop loading" : "Reload (\u{2318}R)"
         progressBar.active = tab.isLoading && tab.progress < 1
         progressBar.progress = tab.progress
 
@@ -327,13 +366,15 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
             if urlField.stringValue != text { urlField.stringValue = text }
         }
 
+        urlBar.showSecurity(for: tab.url)
         let bookmarked = tab.url.map { Store.shared.isBookmarked($0) } ?? false
-        bookmarkButton.image = NSImage(systemSymbolName: bookmarked ? "star.fill" : "star",
-                                        accessibilityDescription: "Bookmark")
-        bookmarkButton.contentTintColor = bookmarked ? .systemYellow : .secondaryLabelColor
+        bookmarkButton.setSymbol(bookmarked ? "star.fill" : "star")
+        bookmarkButton.isHighlighted2 = bookmarked
+        bookmarkButton.isEnabled = tab.url != nil
 
         let blocking = Config.shared.blockAdsAndTrackers && ContentBlocker.ruleList != nil
-        shieldButton.contentTintColor = blocking ? .controlAccentColor : .quaternaryLabelColor
+        shieldButton.isHighlighted2 = blocking
+        shieldButton.setSymbol(blocking ? "shield.lefthalf.filled" : "shield.slash")
         shieldButton.toolTip = blocking
             ? "Blocking \(ContentBlocker.ruleCount) ad & tracker rules \u{2014} click to disable"
             : "Ad & tracker blocking off \u{2014} click to enable"
@@ -486,7 +527,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     private func startMemoryReadout() {
         guard Config.shared.showMemoryReadout else { return }
         updateMemoryReadout()
-        memoryTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
+        memoryTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: true) { [weak self] _ in
             guard let self, let w = self.window,
                   w.isVisible, w.occlusionState.contains(.visible) else { return }
             self.updateMemoryReadout()
@@ -498,14 +539,16 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         let s = MemoryMonitor.sample()
         let sleeping = tabs.filter { $0.isHibernated }.count
         var text = s.display
-        if sleeping > 0 { text += "  \u{00B7}  \(sleeping) asleep" }
-        statusLabel.stringValue = text
-        statusLabel.toolTip = "\(s.display) total \u{2014} app \(ByteCountFormatter.string(fromByteCount: Int64(s.appBytes), countStyle: .memory)) + \(s.helperCount) web process\(s.helperCount == 1 ? "" : "es")"
+        if sleeping > 0 { text += " \u{00B7} \(sleeping) asleep" }
+        statusPill.text = text
+        statusPill.toolTip = "\(s.display) total \u{2014} app \(ByteCountFormatter.string(fromByteCount: Int64(s.appBytes), countStyle: .memory)) + \(s.helperCount) web process\(s.helperCount == 1 ? "" : "es")"
+        layoutChrome()
     }
 
     func showStatus(_ message: String) {
         statusResetWork?.cancel()
-        statusLabel.stringValue = message
+        statusPill.text = message
+        layoutChrome()
         let work = DispatchWorkItem { [weak self] in
             self?.statusResetWork = nil
             self?.updateMemoryReadout()
@@ -571,9 +614,70 @@ extension BrowserWindowController: TabStripDelegate {
     func tabStripDidSelect(index: Int) { selectTab(index: index) }
     func tabStripDidRequestClose(index: Int) { closeTab(index: index) }
     func tabStripDidRequestNewTab() { newTab() }
+
+    /// Handlers capture the Tab itself, not its index, so a menu left open while tabs
+    /// move around cannot act on the wrong one.
+    func tabStripContextActions(index: Int) -> [(String, () -> Void)] {
+        guard tabs.indices.contains(index) else { return [] }
+        let tab = tabs[index]
+        var items: [(String, () -> Void)] = []
+
+        items.append(("Reload", { [weak self] in
+            tab.reload(); self?.refreshChrome()
+        }))
+        items.append(("Duplicate Tab", { [weak self] in
+            guard let self, let u = tab.url else { return }
+            self.newTab(url: u)
+        }))
+        if let u = tab.url {
+            items.append(("Copy Address", {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(u.absoluteString, forType: .string)
+            }))
+        }
+        items.append(("-", {}))
+        if !tab.isHibernated {
+            items.append(("Put Tab to Sleep", { [weak self] in
+                guard let self else { return }
+                // Never tear down the tab currently on screen.
+                if tab === self.activeTab { self.showStatus("Can\u{2019}t sleep the active tab"); return }
+                tab.hibernate()
+                self.refreshChrome()
+            }))
+        }
+        items.append(("-", {}))
+        items.append(("Close Tab", { [weak self] in
+            guard let self, let i = self.tabs.firstIndex(where: { $0 === tab }) else { return }
+            self.closeTab(index: i)
+        }))
+        if tabs.count > 1 {
+            items.append(("Close Other Tabs", { [weak self] in
+                guard let self else { return }
+                for other in self.tabs where other !== tab {
+                    if let u = other.url { self.closedTabs.append(other.snapshot()); _ = u }
+                    other.webView?.removeFromSuperview()
+                    other.hibernate()
+                }
+                self.tabs = [tab]
+                self.activeIndex = 0
+                self.attachActiveTab()
+                self.refreshChrome()
+                self.scheduleSessionSave()
+            }))
+        }
+        return items
+    }
 }
 
 extension BrowserWindowController: NSTextFieldDelegate {
+    func controlTextDidBeginEditing(_ obj: Notification) {
+        if (obj.object as? NSTextField) === urlField { urlBar.setFocused(true) }
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        if (obj.object as? NSTextField) === urlField { urlBar.setFocused(false) }
+    }
+
     func controlTextDidChange(_ obj: Notification) {
         guard (obj.object as? NSTextField) === urlField, !suppressCompletion,
               let editor = urlField.currentEditor() as? NSTextView else { return }

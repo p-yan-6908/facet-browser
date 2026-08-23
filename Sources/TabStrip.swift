@@ -4,6 +4,8 @@ protocol TabStripDelegate: AnyObject {
     func tabStripDidSelect(index: Int)
     func tabStripDidRequestClose(index: Int)
     func tabStripDidRequestNewTab()
+    /// Title/handler pairs for a tab's right-click menu; "-" means a separator.
+    func tabStripContextActions(index: Int) -> [(String, () -> Void)]
 }
 
 /// One view per tab, everything drawn by hand. A stock NSTableView or NSSegmented
@@ -21,6 +23,7 @@ final class TabItemView: NSView {
     private var closeHovering = false { didSet { needsDisplay = true } }
     var onSelect: (() -> Void)?
     var onClose: (() -> Void)?
+    var contextActions: [(String, () -> Void)] = []
 
     private var trackingAreaRef: NSTrackingArea?
 
@@ -56,6 +59,24 @@ final class TabItemView: NSView {
     }
 
     override func otherMouseDown(with event: NSEvent) { onClose?() }  // middle-click closes
+
+    override func rightMouseDown(with event: NSEvent) {
+        guard !contextActions.isEmpty else { return super.rightMouseDown(with: event) }
+        let menu = NSMenu()
+        for (i, entry) in contextActions.enumerated() {
+            if entry.0 == "-" { menu.addItem(.separator()); continue }
+            let item = NSMenuItem(title: entry.0, action: #selector(runContextAction(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = i
+            menu.addItem(item)
+        }
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
+    }
+
+    @objc private func runContextAction(_ sender: NSMenuItem) {
+        guard contextActions.indices.contains(sender.tag) else { return }
+        contextActions[sender.tag].1()
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         let r = bounds.insetBy(dx: 1.5, dy: 3)
@@ -211,6 +232,7 @@ final class TabStripView: NSView {
             v.isLoading = tab.isLoading
             v.progress = tab.progress
             v.isPrivate = tab.isPrivate
+            v.contextActions = delegate?.tabStripContextActions(index: i) ?? []
             v.toolTip = tab.isHibernated
                 ? "\(tab.displayTitle) \u{2014} sleeping (0 MB)"
                 : tab.url?.absoluteString ?? tab.displayTitle
@@ -238,6 +260,16 @@ final class TabStripView: NSView {
     override func layout() {
         super.layout()
         layoutTabs()
+    }
+
+    /// Double-clicking empty strip space opens a tab, as in every other browser. Single
+    /// clicks fall through so the window can still be dragged by its top bar.
+    override func mouseDown(with event: NSEvent) {
+        if event.clickCount == 2 {
+            delegate?.tabStripDidRequestNewTab()
+            return
+        }
+        super.mouseDown(with: event)
     }
 }
 
