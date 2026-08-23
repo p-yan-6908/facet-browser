@@ -394,6 +394,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
 
     @objc func reload() { activeTab?.reload() }
 
+    @objc func stopLoading() {
+        guard let tab = activeTab, tab.isLoading else { return }
+        tab.stop()
+        refreshChrome()
+    }
+
     @objc func toggleBlocking() {
         Config.shared.blockAdsAndTrackers.toggle()
         Config.shared.save()
@@ -614,6 +620,22 @@ extension BrowserWindowController: TabStripDelegate {
     func tabStripDidSelect(index: Int) { selectTab(index: index) }
     func tabStripDidRequestClose(index: Int) { closeTab(index: index) }
     func tabStripDidRequestNewTab() { newTab() }
+
+    func tabStripDidRequestMove(from: Int, to: Int) {
+        guard tabs.indices.contains(from), tabs.indices.contains(to), from != to else { return }
+        let moved = tabs.remove(at: from)
+        tabs.insert(moved, at: to)
+        // Keep the selection on the same tab, not the same slot.
+        if activeIndex == from {
+            activeIndex = to
+        } else if from < activeIndex, to >= activeIndex {
+            activeIndex -= 1
+        } else if from > activeIndex, to <= activeIndex {
+            activeIndex += 1
+        }
+        refreshChrome()
+        scheduleSessionSave()
+    }
 
     /// Handlers capture the Tab itself, not its index, so a menu left open while tabs
     /// move around cannot act on the wrong one.

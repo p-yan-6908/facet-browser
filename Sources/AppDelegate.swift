@@ -106,6 +106,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func reopenClosedTab() { front?.reopenClosedTab() }
     @objc func focusAddressBar() { front?.focusURLField() }
     @objc func reload() { front?.reload() }
+    @objc func stopLoading() { front?.stopLoading() }
     @objc func goBack() { front?.goBack() }
     @objc func goForward() { front?.goForward() }
     @objc func find() { front?.showFindBar() }
@@ -305,6 +306,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // View
         let (_, view) = menu("View")
         add(view, "Reload Page", #selector(reload), "r", target: self)
+        add(view, "Stop", #selector(stopLoading), ".", target: self)
         view.addItem(.separator())
         add(view, "Actual Size", #selector(zoomReset), "0", target: self)
         add(view, "Zoom In", #selector(zoomIn), "+", target: self)
@@ -331,6 +333,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         windowMenu.addItem(.separator())
         add(windowMenu, "Show Next Tab", #selector(nextTab), "\u{0009}", [.control], target: self)
         add(windowMenu, "Show Previous Tab", #selector(previousTab), "\u{0009}", [.control, .shift], target: self)
+        // Arrow variants: the shortcut most people reach for first.
+        add(windowMenu, "Next Tab (arrow)", #selector(nextTab), "\u{F703}", [.command, .option], target: self)
+        add(windowMenu, "Previous Tab (arrow)", #selector(previousTab), "\u{F702}", [.command, .option], target: self)
         windowMenu.addItem(.separator())
         for n in 1...9 {
             add(windowMenu, "Tab \(n)", #selector(selectTabByNumber(_:)), "\(n)", target: self, tag: n - 1)

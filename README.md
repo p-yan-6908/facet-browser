@@ -164,10 +164,10 @@ To make it your default browser: **Kestrel → Make Kestrel the Default Browser*
 | `⌘T` / `⌘W` | new tab / close tab |
 | `⌘⇧T` | reopen the tab you just closed |
 | `⌘N` / `⌘⇧N` | new window / new private window |
-| `^⇥` / `^⇧⇥` | next / previous tab |
+| `^⇥` / `^⇧⇥` | next / previous tab (also `⌘⌥←` / `⌘⌥→`) |
 | `⌘1`–`⌘9` | jump to tab |
 | `⌘[` / `⌘]` | back / forward (or two-finger swipe) |
-| `⌘R` | reload |
+| `⌘R` / `⌘.` | reload / stop |
 | `⌘F` / `⌘G` / `⌘⇧G` | find, find next, find previous |
 | `⌘D` | bookmark |
 | `⌘+` / `⌘-` / `⌘0` | zoom |
@@ -176,9 +176,13 @@ To make it your default browser: **Kestrel → Make Kestrel the Default Browser*
 | `⌘,` | settings (opens config.json) |
 
 **Mouse.** Middle-click or ⌘-click a link opens it in a background tab.
-Middle-click a tab closes it. **Right-click a tab** for reload, duplicate, copy
-address, put-to-sleep, close and close-others. Double-click empty space in the tab
-strip for a new tab. Right-click a page → Inspect Element opens Web Inspector.
+Middle-click a tab closes it. **Drag a tab** to reorder it. **Right-click a tab** for
+reload, duplicate, copy address, put-to-sleep, close and close-others. Double-click
+empty space in the tab strip for a new tab. Right-click a page → Inspect Element
+opens Web Inspector.
+
+Tabs shrink to fit however many you have open, so the last tab and the `+` button
+stay reachable instead of sliding off the edge of the window.
 
 Sleeping tabs are dimmed in the strip and say so in their tooltip, so a tab
 reloading when you return to it is never a surprise. The pill on the right of the

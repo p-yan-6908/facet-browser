@@ -6,6 +6,7 @@ protocol TabStripDelegate: AnyObject {
     func tabStripDidRequestNewTab()
     /// Title/handler pairs for a tab's right-click menu; "-" means a separator.
     func tabStripContextActions(index: Int) -> [(String, () -> Void)]
+    func tabStripDidRequestMove(from: Int, to: Int)
 }
 
 /// One view per tab, everything drawn by hand. A stock NSTableView or NSSegmented
@@ -24,6 +25,11 @@ final class TabItemView: NSView {
     var onSelect: (() -> Void)?
     var onClose: (() -> Void)?
     var contextActions: [(String, () -> Void)] = []
+    /// Drag-to-reorder. The strip owns the reordering logic; the item only reports
+    /// where the press started and where the pointer is now.
+    var onDragBegan: ((CGFloat) -> Void)?      // press x within this item
+    var onDragChanged: ((NSPoint) -> Void)?    // pointer, window coordinates
+    var onDragEnded: (() -> Void)?
 
     private var trackingAreaRef: NSTrackingArea?
 
@@ -51,11 +57,30 @@ final class TabItemView: NSView {
         closeHovering = closeRect.contains(convert(event.locationInWindow, from: nil))
     }
 
+    private var pressPoint: NSPoint?
+    private var dragging = false
+
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
         if showsClose, closeRect.contains(p) { onClose?(); return }
         if event.type == .otherMouseDown { onClose?(); return }
-        onSelect?()
+        pressPoint = p
+        onSelect?()   // select on press, like Safari, so dragging the current tab feels direct
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let press = pressPoint else { return }
+        let here = convert(event.locationInWindow, from: nil)
+        if !dragging, abs(here.x - press.x) > 5 {
+            dragging = true
+            onDragBegan?(press.x)
+        }
+        if dragging { onDragChanged?(event.locationInWindow) }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if dragging { dragging = false; onDragEnded?() }
+        pressPoint = nil
     }
 
     override func otherMouseDown(with event: NSEvent) { onClose?() }  // middle-click closes
@@ -190,6 +215,10 @@ final class TabStripView: NSView {
     private var items: [TabItemView] = []
     private let newTabButton = NSButton()
 
+    private var dragIndex: Int?
+    private var dragGrabX: CGFloat = 0     // where in the tab the press landed
+    private var dragPointerX: CGFloat = 0  // pointer, strip coordinates
+
     override var isFlipped: Bool { true }
 
     override init(frame frameRect: NSRect) {
@@ -233,11 +262,22 @@ final class TabStripView: NSView {
             v.progress = tab.progress
             v.isPrivate = tab.isPrivate
             v.contextActions = delegate?.tabStripContextActions(index: i) ?? []
+            v.onDragBegan = { [weak self] grabX in self?.beginDrag(i, grabX: grabX) }
+            v.onDragChanged = { [weak self] p in self?.updateDrag(p) }
+            v.onDragEnded = { [weak self] in self?.endDrag() }
             v.toolTip = tab.isHibernated
                 ? "\(tab.displayTitle) \u{2014} sleeping (0 MB)"
                 : tab.url?.absoluteString ?? tab.displayTitle
         }
         layoutTabs()
+    }
+
+    /// Width per tab. Tabs shrink as far as they must so that every tab stays on
+    /// screen and clickable -- a lower bound here would push the last tabs past the
+    /// window edge where they cannot be reached at all.
+    private func tabWidth(available: CGFloat) -> CGFloat {
+        guard !items.isEmpty else { return 0 }
+        return min(210, available / CGFloat(items.count))
     }
 
     private func layoutTabs() {
@@ -247,14 +287,52 @@ final class TabStripView: NSView {
             newTabButton.frame = NSRect(x: 2, y: (bounds.height - 22) / 2, width: buttonW, height: 22)
             return
         }
-        let w = min(210, max(44, available / CGFloat(items.count)))
+        let w = tabWidth(available: available)
         var x: CGFloat = 0
-        for v in items {
+        for (i, v) in items.enumerated() {
+            if i == dragIndex { x += w; continue }   // positioned below, on top of the rest
             v.frame = NSRect(x: x, y: 0, width: w, height: bounds.height)
             x += w
         }
+        if let d = dragIndex, items.indices.contains(d) {
+            let clamped = max(0, min(available - w, dragPointerX - dragGrabX))
+            items[d].frame = NSRect(x: clamped, y: 0, width: w, height: bounds.height)
+        }
         newTabButton.frame = NSRect(x: min(x + 3, bounds.width - buttonW - 2),
                                     y: (bounds.height - 22) / 2, width: buttonW, height: 22)
+    }
+
+    // MARK: - Drag to reorder
+
+    private func beginDrag(_ index: Int, grabX: CGFloat) {
+        guard items.indices.contains(index) else { return }
+        dragIndex = index
+        dragGrabX = grabX
+        dragPointerX = items[index].frame.minX + grabX
+        addSubview(items[index])          // raise above its neighbours while moving
+    }
+
+    private func updateDrag(_ pointerInWindow: NSPoint) {
+        guard let from = dragIndex else { return }
+        dragPointerX = convert(pointerInWindow, from: nil).x
+        let available = max(0, bounds.width - 32)
+        let w = tabWidth(available: available)
+        guard w > 0 else { return }
+
+        let leadingEdge = dragPointerX - dragGrabX
+        let to = max(0, min(items.count - 1, Int(((leadingEdge + w / 2) / w).rounded(.down))))
+        if to != from {
+            dragIndex = to
+            // The delegate reorders and calls update(), which re-lays out around the
+            // dragged tab; grabX is preserved so the tab stays under the pointer.
+            delegate?.tabStripDidRequestMove(from: from, to: to)
+        }
+        layoutTabs()
+    }
+
+    private func endDrag() {
+        dragIndex = nil
+        layoutTabs()
     }
 
     override func layout() {
