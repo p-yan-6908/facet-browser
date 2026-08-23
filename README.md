@@ -1,6 +1,6 @@
 # Kestrel
 
-A minimal macOS web browser. One 904 KB app bundle, no dependencies, no bundled
+A minimal macOS web browser. A single ~900 KB app bundle, no dependencies, no bundled
 engine, no background services.
 
 Built because Chrome ships its own entire copy of Chromium plus a GPU process, a
