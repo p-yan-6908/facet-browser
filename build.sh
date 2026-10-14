@@ -1,24 +1,37 @@
 #!/bin/bash
-# Build Kestrel into a runnable .app bundle. No dependencies, no package manager.
+# Build Facet into a runnable .app bundle. No dependencies, no package manager.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-APP="Kestrel.app"
-NAME="Kestrel"
-BUNDLE_ID="com.kestrel.browser"
-VERSION="1.0"
+APP="Facet.app"
+NAME="Facet"
+BUNDLE_ID="com.facet.browser"
+VERSION="${FACET_VERSION:-1.0.0}"
+BUILD_NUMBER="${FACET_BUILD_NUMBER:-$VERSION}"
+ARCHS="${FACET_ARCHS:-arm64}"
+SIGN_IDENTITY="${FACET_SIGN_IDENTITY:--}"
 DEST="${1:-.}"
 
-echo "==> Compiling ($(ls Sources/*.swift | wc -l | tr -d ' ') files)"
+echo "==> Compiling ($(ls Sources/*.swift | wc -l | tr -d ' ') files) for $ARCHS"
 rm -rf "$APP"
 mkdir -p build "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-swiftc \
-  -O -whole-module-optimization -swift-version 5 \
-  -target arm64-apple-macos13.0 \
-  -framework AppKit -framework WebKit \
-  -o "$APP/Contents/MacOS/$NAME" \
-  Sources/*.swift
+bins=()
+for arch in $ARCHS; do
+  out="build/$NAME-$arch"
+  swiftc \
+    -O -whole-module-optimization -swift-version 5 \
+    -target "$arch-apple-macos13.0" \
+    -framework AppKit -framework WebKit -framework Security -lsqlite3 \
+    -o "$out" \
+    Sources/*.swift
+  bins+=("$out")
+done
+if [ "${#bins[@]}" -eq 1 ]; then
+  cp "${bins[0]}" "$APP/Contents/MacOS/$NAME"
+else
+  lipo -create "${bins[@]}" -output "$APP/Contents/MacOS/$NAME"
+fi
 
 cp Resources/blocked-domains.txt "$APP/Contents/Resources/"
 
@@ -33,7 +46,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
-  <key>CFBundleVersion</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$BUILD_NUMBER</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
@@ -54,6 +67,12 @@ cat > "$APP/Contents/Info.plist" <<PLIST
       <key>CFBundleURLSchemes</key>
       <array><string>http</string><string>https</string></array>
     </dict>
+    <dict>
+      <key>CFBundleURLName</key><string>Facet OAuth Callback</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>CFBundleURLSchemes</key>
+      <array><string>facet</string></array>
+    </dict>
   </array>
   <key>CFBundleDocumentTypes</key>
   <array>
@@ -71,7 +90,14 @@ PLIST
 # Generate a simple app icon from an SF Symbol-ish drawing.
 if [ -x /usr/bin/python3 ]; then python3 tools/make_icon.py "$APP/Contents/Resources/AppIcon.icns" || true; fi
 
-codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || echo "   (ad-hoc signing skipped)"
+if [ "$SIGN_IDENTITY" = "-" ]; then
+  codesign --force --sign - "$APP"
+  echo "==> Ad-hoc signed"
+else
+  codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
+  echo "==> Developer ID signed with hardened runtime"
+fi
+codesign --verify --strict --verbose=2 "$APP"
 touch "$APP"
 
 if [ "$DEST" != "." ]; then

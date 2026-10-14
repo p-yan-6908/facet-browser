@@ -2,13 +2,13 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>Kestrel</string>
-  <key>CFBundleDisplayName</key><string>Kestrel</string>
-  <key>CFBundleExecutable</key><string>Kestrel</string>
-  <key>CFBundleIdentifier</key><string>com.kestrel.browser</string>
+  <key>CFBundleName</key><string>Facet</string>
+  <key>CFBundleDisplayName</key><string>Facet</string>
+  <key>CFBundleExecutable</key><string>Facet</string>
+  <key>CFBundleIdentifier</key><string>com.facet.browser</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
-  <key>CFBundleVersion</key><string>1.0</string>
+  <key>CFBundleShortVersionString</key><string>1.0.0</string>
+  <key>CFBundleVersion</key><string>1.0.0</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
@@ -28,6 +28,12 @@
       <key>CFBundleTypeRole</key><string>Viewer</string>
       <key>CFBundleURLSchemes</key>
       <array><string>http</string><string>https</string></array>
+    </dict>
+    <dict>
+      <key>CFBundleURLName</key><string>Facet OAuth Callback</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>CFBundleURLSchemes</key>
+      <array><string>facet</string></array>
     </dict>
   </array>
   <key>CFBundleDocumentTypes</key>

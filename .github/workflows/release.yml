@@ -1,0 +1,106 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      CERT_B64: ${{ secrets.DEVELOPER_ID_CERT_BASE64 }}
+      CERT_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require release credentials
+        run: |
+          test -n "$CERT_B64" || { echo "Missing DEVELOPER_ID_CERT_BASE64"; exit 1; }
+          test -n "$CERT_PASSWORD" || { echo "Missing DEVELOPER_ID_CERT_PASSWORD"; exit 1; }
+          test -n "$APPLE_ID" || { echo "Missing APPLE_ID"; exit 1; }
+          test -n "$APPLE_TEAM_ID" || { echo "Missing APPLE_TEAM_ID"; exit 1; }
+          test -n "$APPLE_APP_PASSWORD" || { echo "Missing APPLE_APP_SPECIFIC_PASSWORD"; exit 1; }
+
+      - name: Regression suite
+        run: |
+          bash tools/run-polish-tests.sh --webkit
+          bash tools/run-blocktest.sh
+          git diff --check
+
+      - name: Ensure current Google Chrome
+        run: |
+          if [[ ! -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ]]; then
+            brew install --cask google-chrome
+          fi
+          CHROME_REQUIRED=1 tools/chrome-compat-smoke.sh
+
+      - name: Import Developer ID certificate
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/facet-build.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          printf "%s" "$CERT_B64" | base64 -D > "$RUNNER_TEMP/developer-id.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/developer-id.p12" -k "$KEYCHAIN_PATH" -P "$CERT_PASSWORD" -A -t cert -f pkcs12
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | sed -n "s/.*\"\(Developer ID Application:.*\)\"/\1/p" | head -n 1)"
+          test -n "$IDENTITY" || { echo "Developer ID Application identity not found"; exit 1; }
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          echo "SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Build universal signed app
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          FACET_VERSION="$VERSION" FACET_BUILD_NUMBER="$GITHUB_RUN_NUMBER" FACET_ARCHS="arm64 x86_64" FACET_SIGN_IDENTITY="$SIGN_IDENTITY" ./build.sh
+          lipo -archs Facet.app/Contents/MacOS/Facet
+          codesign --verify --deep --strict --verbose=2 Facet.app
+
+      - name: Notarize and staple
+        run: |
+          NOTARY_ZIP="$RUNNER_TEMP/Facet-notary.zip"
+          ditto -c -k --keepParent Facet.app "$NOTARY_ZIP"
+          xcrun notarytool submit "$NOTARY_ZIP" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple Facet.app
+          xcrun stapler validate Facet.app
+          codesign --verify --deep --strict --verbose=2 Facet.app
+          spctl --assess --type execute --verbose=2 Facet.app
+
+      - name: Package release
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          ZIP="Facet-${VERSION}-macOS-universal.zip"
+          ditto -c -k --sequesterRsrc --keepParent Facet.app "$ZIP"
+          shasum -a 256 "$ZIP" > "$ZIP.sha256"
+          echo "RELEASE_ZIP=$ZIP" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Facet-${{ github.ref_name }}
+          path: |
+            ${{ env.RELEASE_ZIP }}
+            ${{ env.RELEASE_ZIP }}.sha256
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" "$RELEASE_ZIP" "$RELEASE_ZIP.sha256" --verify-tag --title "Facet $VERSION" --generate-notes
+
+      - name: Remove temporary keychain
+        if: always()
+        run: |
+          if [[ -n "${KEYCHAIN_PATH:-}" && -f "$KEYCHAIN_PATH" ]]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi

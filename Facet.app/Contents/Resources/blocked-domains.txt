@@ -1,6 +1,6 @@
-# Kestrel blocklist — one domain per line, '#' for comments.
-# Matches the domain and all its subdomains. Edit and restart Kestrel to apply.
-# A user copy is created at ~/Library/Application Support/Kestrel/blocked-domains.txt
+# Facet blocklist — one domain per line, '#' for comments.
+# Matches the domain and all its subdomains. Edit and restart Facet to apply.
+# A user copy is created at ~/Library/Application Support/Facet/blocked-domains.txt
 # which takes precedence over this bundled one.
 
 # --- Google advertising / measurement ---

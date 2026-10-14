@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 12 * * 1"
+
+concurrency:
+  group: facet-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: Validate scripts and diff
+        run: |
+          bash -n build.sh
+          bash -n tools/run-polish-tests.sh
+          bash -n tools/run-blocktest.sh
+          bash -n tools/chrome-compat-smoke.sh
+          git diff --check
+
+      - name: Optimized app build
+        run: ./build.sh
+
+      - name: Verify app signature
+        run: codesign --verify --strict --verbose=2 Facet.app
+
+      - name: Regression suite
+        run: bash tools/run-polish-tests.sh --webkit
+
+      - name: Content blocker suite
+        run: bash tools/run-blocktest.sh
+
+      - name: Ensure current Google Chrome
+        run: |
+          if [[ ! -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ]]; then
+            brew install --cask google-chrome
+          fi
+          "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --version
+
+      - name: Current Chrome compatibility
+        env:
+          CHROME_REQUIRED: "1"
+        run: tools/chrome-compat-smoke.sh
+
+      - name: Final diff check
+        run: git diff --check

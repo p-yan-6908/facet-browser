@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 struct HistoryEntry {
     var url: String
@@ -12,6 +13,12 @@ struct SavedTab {
     var title: String
     /// WKWebView.interactionState blob: full back/forward list + scroll position.
     var interactionState: Data?
+}
+
+struct SavedWindow {
+    var tabs: [SavedTab]
+    var activeIndex: Int
+    var frame: NSRect?
 }
 
 /// Flat-file persistence. Everything is small, loaded once, and written debounced,
@@ -78,6 +85,31 @@ final class Store {
         flush()
     }
 
+    /// Merge imported history idempotently: repeated imports do not inflate visit counts.
+    /// Existing Facet activity wins when it is newer; otherwise imported title/date fill in.
+    @discardableResult
+    func importHistory(_ entries: [HistoryEntry]) -> Int {
+        var added = 0
+        for e in entries {
+            guard let u = URL(string: e.url), let scheme = u.scheme?.lowercased(), scheme == "http" || scheme == "https" else { continue }
+            if let i = historyIndex[e.url] {
+                history[i].visits = max(history[i].visits, max(1, e.visits))
+                if e.lastVisit > history[i].lastVisit {
+                    history[i].lastVisit = e.lastVisit
+                    if !e.title.isEmpty { history[i].title = e.title }
+                } else if history[i].title.isEmpty && !e.title.isEmpty {
+                    history[i].title = e.title
+                }
+            } else {
+                history.append(HistoryEntry(url: e.url, title: e.title, visits: max(1, e.visits), lastVisit: e.lastVisit))
+                historyIndex[e.url] = history.count - 1
+                added += 1
+            }
+        }
+        if !entries.isEmpty { historyDirty = true }
+        return added
+    }
+
     /// Frecency-ranked prefix/substring match over history + bookmarks, for the URL bar.
     func suggestions(for query: String, limit: Int = 8) -> [String] {
         let q = query.lowercased().trimmingCharacters(in: .whitespaces)
@@ -139,30 +171,76 @@ final class Store {
         write(bookmarks, to: bookmarksURL)
     }
 
-    // MARK: - Session
-
-    func saveSession(_ tabs: [SavedTab], activeIndex: Int) {
-        let arr: [[String: Any]] = tabs.map { t in
-            var d: [String: Any] = ["url": t.url, "title": t.title]
-            if let s = t.interactionState { d["state"] = s.base64EncodedString() }
-            return d
+    /// Merge imported bookmarks by URL. Facet's existing title is preserved unless blank.
+    @discardableResult
+    func importBookmarks(_ entries: [HistoryEntry]) -> Int {
+        var byURL: [String: Int] = [:]
+        for (i, e) in bookmarks.enumerated() { byURL[e.url] = i }
+        var added = 0
+        for e in entries {
+            guard let u = URL(string: e.url), let scheme = u.scheme?.lowercased(), scheme == "http" || scheme == "https" else { continue }
+            if let i = byURL[e.url] {
+                if bookmarks[i].title.isEmpty && !e.title.isEmpty { bookmarks[i].title = e.title }
+            } else {
+                bookmarks.append(HistoryEntry(url: e.url, title: e.title.isEmpty ? u.host ?? "" : e.title,
+                                              visits: 1, lastVisit: e.lastVisit))
+                byURL[e.url] = bookmarks.count - 1
+                added += 1
+            }
         }
-        let payload: [String: Any] = ["tabs": arr, "active": activeIndex]
-        if let data = try? JSONSerialization.data(withJSONObject: payload) {
-            try? data.write(to: sessionURL, options: .atomic)
-        }
+        if !entries.isEmpty { write(bookmarks, to: bookmarksURL) }
+        return added
     }
 
-    func loadSession() -> (tabs: [SavedTab], activeIndex: Int) {
-        guard let data = try? Data(contentsOf: sessionURL),
-              let d = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let arr = d["tabs"] as? [[String: Any]] else { return ([], 0) }
-        let tabs: [SavedTab] = arr.compactMap { e in
-            guard let url = e["url"] as? String, !url.isEmpty else { return nil }
-            let state = (e["state"] as? String).flatMap { Data(base64Encoded: $0) }
-            return SavedTab(url: url, title: e["title"] as? String ?? "", interactionState: state)
+    // MARK: - Session
+
+    /// Persist every normal window atomically. Version 2 stays backward-compatible
+    /// with the original single-window session file.
+    func saveSession(windows: [SavedWindow], selectedWindow: Int?) {
+        func encodeTab(_ t: SavedTab) -> [String: Any] {
+            var d: [String: Any] = ["url": t.url, "title": t.title]
+            if let state = t.interactionState { d["state"] = state.base64EncodedString() }
+            return d
         }
-        return (tabs, d["active"] as? Int ?? 0)
+        let encoded: [[String: Any]] = windows.map { w in
+            var d: [String: Any] = ["tabs": w.tabs.map(encodeTab), "active": w.activeIndex]
+            if let f = w.frame { d["frame"] = ["x": f.origin.x, "y": f.origin.y, "w": f.size.width, "h": f.size.height] }
+            return d
+        }
+        var payload: [String: Any] = ["version": 2, "windows": encoded]
+        if let selectedWindow { payload["selectedWindow"] = selectedWindow }
+        if let data = try? JSONSerialization.data(withJSONObject: payload) { try? data.write(to: sessionURL, options: .atomic) }
+    }
+
+    func loadSessionWindows() -> (windows: [SavedWindow], selectedWindow: Int?) {
+        guard let data = try? Data(contentsOf: sessionURL),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return ([], nil) }
+        func decodeTabs(_ arr: [[String: Any]]) -> [SavedTab] {
+            arr.compactMap { e in
+                guard let url = e["url"] as? String, !url.isEmpty else { return nil }
+                let state = (e["state"] as? String).flatMap { Data(base64Encoded: $0) }
+                return SavedTab(url: url, title: e["title"] as? String ?? "", interactionState: state)
+            }
+        }
+        func decodeFrame(_ any: Any?) -> NSRect? {
+            guard let d = any as? [String: Any], let x = d["x"] as? NSNumber,
+                  let y = d["y"] as? NSNumber, let w = d["w"] as? NSNumber,
+                  let h = d["h"] as? NSNumber, w.doubleValue >= 520, h.doubleValue >= 380 else { return nil }
+            return NSRect(x: x.doubleValue, y: y.doubleValue, width: w.doubleValue, height: h.doubleValue)
+        }
+        if let rawWindows = root["windows"] as? [[String: Any]] {
+            let windows = rawWindows.compactMap { d -> SavedWindow? in
+                guard let arr = d["tabs"] as? [[String: Any]] else { return nil }
+                let tabs = decodeTabs(arr); guard !tabs.isEmpty else { return nil }
+                let active = min(max(0, d["active"] as? Int ?? 0), max(0, tabs.count - 1))
+                return SavedWindow(tabs: tabs, activeIndex: active, frame: decodeFrame(d["frame"]))
+            }
+            return (windows, root["selectedWindow"] as? Int)
+        }
+        guard let arr = root["tabs"] as? [[String: Any]] else { return ([], nil) }
+        let tabs = decodeTabs(arr); guard !tabs.isEmpty else { return ([], nil) }
+        let active = min(max(0, root["active"] as? Int ?? 0), max(0, tabs.count - 1))
+        return ([SavedWindow(tabs: tabs, activeIndex: active, frame: nil)], 0)
     }
 
     // MARK: - Disk

@@ -17,6 +17,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     private let progressBar = ProgressBar()
     private let webContainer = FlippedView()
     private let startView = StartView()
+    private let agentSidebar = AgentSidebarView()
+    private var agentSidebarVisible = false
+    private let agentSidebarWidth: CGFloat = 360
 
     private let chromeBackground = NSVisualEffectView()
     private let hairline = HairlineView()
@@ -40,7 +43,6 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
 
     private var hibernationTimer: Timer?
     private var memoryTimer: Timer?
-    private var memoryPressureSource: DispatchSourceMemoryPressure?
     private var sessionSaveScheduled = false
     private var suppressCompletion = false
     private var statusResetWork: DispatchWorkItem?
@@ -62,22 +64,23 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         super.init(window: w)
 
         w.delegate = self
-        w.title = isPrivate ? "Kestrel Private" : "Kestrel"
+        w.title = isPrivate ? "Facet Private" : "Facet"
         w.titleVisibility = .hidden
         w.titlebarAppearsTransparent = true
         w.isMovableByWindowBackground = true
         w.minSize = NSSize(width: 520, height: 380)
         w.tabbingMode = .disallowed          // we manage our own tabs
-        w.setFrameAutosaveName(isPrivate ? "KestrelPrivateWindow" : "KestrelWindow")
         w.backgroundColor = .windowBackgroundColor
         if #available(macOS 11.0, *) { w.titlebarSeparatorStyle = .none }
 
         buildChrome()
         w.contentView = root
+        // Restoring an autosaved frame can synchronously emit a resize notification.
+        // Wait until the toolbar controls exist before applying it.
+        w.setFrameAutosaveName(isPrivate ? "FacetPrivateWindow" : "FacetWindow")
 
         startHibernationTimer()
         startMemoryReadout()
-        installMemoryPressureHandling()
 
         Downloads.shared.statusHandler = { [weak self] msg in self?.showStatus(msg) }
     }
@@ -100,6 +103,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         root.addSubview(findRow)
         root.addSubview(hairline)
         root.addSubview(webContainer)
+        root.addSubview(agentSidebar)
+        agentSidebar.isHidden = true
+        agentSidebar.onClose = { [weak self] in self?.setAgentSidebarVisible(false) }
 
         tabStrip.delegate = self
         progressBar.active = false
@@ -179,8 +185,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         chromeBackground.frame = NSRect(x: 0, y: 0, width: b.width, height: chromeBottom)
         hairline.frame = NSRect(x: 0, y: chromeBottom - 1, width: b.width, height: 1)
 
-        webContainer.frame = NSRect(x: 0, y: chromeBottom, width: b.width,
+        let sidebarWidth = agentSidebarVisible ? min(agentSidebarWidth, max(300, b.width * 0.38)) : 0
+        webContainer.frame = NSRect(x: 0, y: chromeBottom, width: max(0, b.width - sidebarWidth),
                                     height: max(0, b.height - chromeBottom))
+        agentSidebar.frame = NSRect(x: b.width - sidebarWidth, y: chromeBottom, width: sidebarWidth,
+                                    height: max(0, b.height - chromeBottom))
+        agentSidebar.isHidden = !agentSidebarVisible
         startView.frame = webContainer.bounds
         activeTab?.webView?.frame = webContainer.bounds
 
@@ -226,14 +236,27 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     func windowDidBecomeKey(_ notification: Notification) {
         activeTab?.lastActive = Date()
         Downloads.shared.statusHandler = { [weak self] msg in self?.showStatus(msg) }
+        if agentSidebarVisible { agentSidebar.activate() }
     }
 
     func windowWillClose(_ notification: Notification) {
         saveSessionNow()
         hibernationTimer?.invalidate()
         memoryTimer?.invalidate()
-        memoryPressureSource?.cancel()
         AppDelegate.shared?.windowClosed(self)
+    }
+
+    func toggleAgentSidebar() {
+        guard !isPrivateWindow else { showStatus("Assistant is unavailable in Private windows"); return }
+        setAgentSidebarVisible(!agentSidebarVisible)
+    }
+
+    func setAgentSidebarVisible(_ visible: Bool) {
+        guard !isPrivateWindow else { return }
+        agentSidebarVisible = visible
+        if visible { agentSidebar.activate() } else { agentSidebar.prepareToHide() }
+        layoutChrome()
+        if !visible { focusWebContent() }
     }
 
     // MARK: - Tabs
@@ -243,7 +266,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         let tab = Tab(url: url, isPrivate: isPrivateWindow, delegate: self, configuration: configuration)
         tabs.append(tab)
         // An opener-created tab must have its web view before we return it to WebKit.
-        if configuration != nil { tab.ensureLoaded() }
+        if configuration != nil {
+            MemoryBudgetController.shared.prepareToActivate(tab)
+            tab.ensureLoaded()
+        }
         if activate {
             activeIndex = tabs.count - 1
             attachActiveTab()
@@ -321,6 +347,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         webContainer.subviews.forEach { $0.removeFromSuperview() }
         guard let tab = activeTab else { return }
         tab.lastActive = Date()
+        MemoryBudgetController.shared.prepareToActivate(tab)
 
         if tab.url == nil && !tab.hasEverLoaded {
             startView.rebuild()
@@ -509,29 +536,22 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     @objc func hibernateBackgroundTabsNow() {
         var slept = 0
         for (i, tab) in tabs.enumerated() where i != activeIndex {
-            if !tab.isHibernated { tab.hibernate(); slept += 1 }
+            if tab.canHibernateForBudget { tab.hibernate(); slept += 1 }
         }
         refreshChrome()
         showStatus(slept == 0 ? "Nothing to sleep" : "Slept \(slept) tab\(slept == 1 ? "" : "s")")
     }
 
-    private func installMemoryPressureHandling() {
-        guard Config.shared.hibernateOnMemoryPressure else { return }
-        let src = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .main)
-        src.setEventHandler { [weak self] in
-            guard let self else { return }
-            NSLog("Kestrel: memory pressure, sleeping background tabs")
-            self.hibernateBackgroundTabsNow()
-            URLCache.shared.removeAllCachedResponses()
-        }
-        src.resume()
-        memoryPressureSource = src
-    }
-
     // MARK: - Memory readout
 
     private func startMemoryReadout() {
-        guard Config.shared.showMemoryReadout else { return }
+        memoryTimer?.invalidate()
+        memoryTimer = nil
+        guard Config.shared.showMemoryReadout else {
+            statusPill.isHidden = true
+            layoutChrome()
+            return
+        }
         updateMemoryReadout()
         memoryTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: true) { [weak self] _ in
             guard let self, let w = self.window,
@@ -542,13 +562,30 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
 
     private func updateMemoryReadout() {
         guard statusResetWork == nil else { return }   // a transient message is showing
-        let s = MemoryMonitor.sample()
-        let sleeping = tabs.filter { $0.isHibernated }.count
-        var text = s.display
+        let s = MemoryBudgetController.shared.sample(maxAge: 1.0)
+        let sleeping = MemoryBudgetController.shared.sleepingTabCount
+        var text = MemoryBudgetController.shared.budgetDisplay(sample: s)
         if sleeping > 0 { text += " \u{00B7} \(sleeping) asleep" }
         statusPill.text = text
-        statusPill.toolTip = "\(s.display) total \u{2014} app \(ByteCountFormatter.string(fromByteCount: Int64(s.appBytes), countStyle: .memory)) + \(s.helperCount) web process\(s.helperCount == 1 ? "" : "es")"
+        let budgetNote = MemoryBudgetController.shared.isEnabled ? " · target \(Config.shared.memoryBudgetMB) MB" : ""
+        statusPill.toolTip = "\(s.display) total\(budgetNote) \u{2014} app \(ByteCountFormatter.string(fromByteCount: Int64(s.appBytes), countStyle: .memory)) + \(s.helperCount) web process\(s.helperCount == 1 ? "" : "es")"
         layoutChrome()
+    }
+
+    func memoryBudgetDidChange() {
+        if Config.shared.showMemoryReadout { updateMemoryReadout() }
+        refreshChrome()
+    }
+
+    func settingsDidChange() {
+        startHibernationTimer()
+        startMemoryReadout()
+        refreshChrome()
+        layoutChrome()
+    }
+
+    func contentBlockingSettingDidChange() {
+        reloadAllForRuleChange()
     }
 
     func showStatus(_ message: String) {
@@ -574,10 +611,16 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
+    func sessionSnapshot() -> SavedWindow? {
+        guard !isPrivateWindow else { return nil }
+        let snapshots = tabs.filter { $0.url != nil }.map { $0.snapshot() }
+        guard !snapshots.isEmpty else { return nil }
+        return SavedWindow(tabs: snapshots, activeIndex: min(activeIndex, snapshots.count - 1), frame: window?.frame)
+    }
+
     func saveSessionNow() {
         guard !isPrivateWindow else { return }
-        let snapshots = tabs.filter { $0.url != nil }.map { $0.snapshot() }
-        Store.shared.saveSession(snapshots, activeIndex: activeIndex)
+        AppDelegate.shared?.saveApplicationSession()
         Store.shared.flush()
     }
 }
@@ -658,11 +701,17 @@ extension BrowserWindowController: TabStripDelegate {
             }))
         }
         items.append(("-", {}))
+        items.append((tab.keepAwake ? "Allow Tab to Sleep" : "Keep Tab Awake", { [weak self] in
+            tab.keepAwake.toggle()
+            self?.refreshChrome()
+            self?.showStatus(tab.keepAwake ? "Tab will stay awake" : "Tab can sleep again")
+        }))
         if !tab.isHibernated {
             items.append(("Put Tab to Sleep", { [weak self] in
                 guard let self else { return }
                 // Never tear down the tab currently on screen.
                 if tab === self.activeTab { self.showStatus("Can\u{2019}t sleep the active tab"); return }
+                if !tab.canHibernateForBudget { self.showStatus("Tab is protected or playing media"); return }
                 tab.hibernate()
                 self.refreshChrome()
             }))

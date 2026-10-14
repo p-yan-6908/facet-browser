@@ -6,11 +6,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var controllers: [BrowserWindowController] = []
     /// URLs can arrive from LaunchServices before the first window exists (clicking a
-    /// link while Kestrel is closed), so hold them until the window is up.
+    /// link while Facet is closed), so hold them until the window is up.
     private var isReady = false
     private var pendingURLs: [URL] = []
     private let bookmarksMenu = NSMenu(title: "Bookmarks")
     private let historyMenu = NSMenu(title: "History")
+    private var settingsWindowController: SettingsWindowController?
+
+    var allControllers: [BrowserWindowController] { controllers }
 
     var front: BrowserWindowController? {
         if let w = NSApp.keyWindow?.windowController as? BrowserWindowController { return w }
@@ -24,6 +27,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         AppDelegate.shared = self
         NSApp.setActivationPolicy(.regular)
         buildMenu()
+        MemoryBudgetController.shared.start()
 
         // Compile the blocklist before the first web view exists: content rules are
         // attached at configuration time, so getting this in first avoids a reload.
@@ -33,53 +37,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func openInitialWindow() {
-        let c = makeWindow()
-        let session = Store.shared.loadSession()
-        if Config.shared.restoreSessionOnLaunch, !session.tabs.isEmpty {
-            c.restore(saved: session.tabs, activeIndex: session.activeIndex)
-            let sleeping = max(0, session.tabs.count - 1)
-            if sleeping > 0 {
-                c.showStatus("Restored \(session.tabs.count) tabs, \(sleeping) asleep")
+        var restoredControllers: [BrowserWindowController] = []
+        var selectedRestored: BrowserWindowController?
+        if Config.shared.restoreSessionOnLaunch {
+            let saved = Store.shared.loadSessionWindows()
+            for (index, state) in saved.windows.enumerated() {
+                let c = makeWindow(show: false, offset: false)
+                c.restore(saved: state.tabs, activeIndex: state.activeIndex)
+                if let frame = state.frame { c.window?.setFrame(frame, display: false) }
+                c.showWindow(nil)
+                restoredControllers.append(c)
+                let sleeping = max(0, state.tabs.count - 1)
+                if sleeping > 0 { c.showStatus("Restored \(state.tabs.count) tabs, \(sleeping) asleep") }
+                if index == (saved.selectedWindow ?? saved.windows.count - 1) { selectedRestored = c }
+                else { c.window?.orderBack(nil) }
             }
+            (selectedRestored ?? restoredControllers.last)?.window?.makeKeyAndOrderFront(nil)
         }
+
+        let c = selectedRestored ?? restoredControllers.last ?? makeWindow()
         if !pendingURLs.isEmpty {
-            // Open every URL, but focus the first, like Safari and Chrome do. Focusing
-            // the last would leave whichever page happened to be at the end of the list
-            // running in the foreground.
             let firstNew = c.tabs.count
-            for u in pendingURLs {
-                let tab = c.newTab(url: u, activate: false)
-                tab.ensureLoaded()   // explicitly requested by the user, so load it now
-            }
-            pendingURLs.removeAll()
-            c.selectTab(index: firstNew)
-        } else if c.tabs.isEmpty {
-            c.newTab()
-        }
+            for u in pendingURLs { _ = c.newTab(url: u, activate: false) }
+            pendingURLs.removeAll(); c.selectTab(index: firstNew)
+        } else if restoredControllers.isEmpty && c.tabs.isEmpty { c.newTab() }
         isReady = true
         rebuildBookmarksMenu()
     }
 
     @discardableResult
-    private func makeWindow(isPrivate: Bool = false) -> BrowserWindowController {
+    private func makeWindow(isPrivate: Bool = false, show: Bool = true, offset: Bool = true) -> BrowserWindowController {
         let c = BrowserWindowController(isPrivate: isPrivate)
         controllers.append(c)
-        c.showWindow(nil)
-        c.window?.makeKeyAndOrderFront(nil)
-        if controllers.count > 1, let w = c.window {
+        MemoryBudgetController.shared.register(c)
+        if show { c.showWindow(nil); c.window?.makeKeyAndOrderFront(nil) }
+        if offset, controllers.count > 1, let w = c.window {
             w.setFrameOrigin(NSPoint(x: w.frame.origin.x + 24, y: w.frame.origin.y - 24))
         }
         return c
     }
 
     func windowClosed(_ controller: BrowserWindowController) {
+        MemoryBudgetController.shared.unregister(controller)
         controllers.removeAll { $0 === controller }
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        controllers.forEach { $0.saveSessionNow() }
+        saveApplicationSession()
         Store.shared.flush()
         return .terminateNow
+    }
+
+    func saveApplicationSession() {
+        let normal = controllers.filter { !$0.isPrivateWindow }
+        let snapshots = normal.compactMap { $0.sessionSnapshot() }
+        let selected = front.flatMap { current in normal.firstIndex(where: { $0 === current }) }
+        Store.shared.saveSession(windows: snapshots, selectedWindow: selected)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
@@ -89,11 +102,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return true
     }
 
-    /// Links opened from other apps (and from being the default browser).
+    /// Links opened from other apps (and from being the default browser). OAuth callback
+    /// URLs are consumed before normal browser routing so authorization codes never become tabs.
     func application(_ application: NSApplication, open urls: [URL]) {
-        guard isReady else { pendingURLs.append(contentsOf: urls); return }
+        let browserURLs = urls.filter { !AgentOAuthManager.shared.handleCallback($0) }
+        guard !browserURLs.isEmpty else { return }
+        guard isReady else { pendingURLs.append(contentsOf: browserURLs); return }
         let c = front ?? makeWindow()
-        for u in urls { c.newTab(url: u) }
+        for u in browserURLs { c.newTab(url: u) }
         c.window?.makeKeyAndOrderFront(nil)
     }
 
@@ -121,6 +137,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func previousTab() { front?.selectRelativeTab(-1) }
     @objc func openDownloadsFolder() { Downloads.shared.revealFolder() }
 
+    @objc func showAgent() {
+        guard Config.shared.agentEnabled else { front?.showStatus("Assistant is disabled in Settings"); return }
+        guard let front else { return }
+        front.toggleAgentSidebar()
+    }
+
     @objc func selectTabByNumber(_ sender: NSMenuItem) {
         guard let c = front else { return }
         let n = sender.tag
@@ -128,8 +150,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func openSettings() {
-        Config.shared.save()
-        NSWorkspace.shared.open(Config.supportDir.appendingPathComponent("config.json"))
+        if settingsWindowController == nil { settingsWindowController = SettingsWindowController() }
+        settingsWindowController?.refresh()
+        settingsWindowController?.showWindow(nil)
+        settingsWindowController?.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc func openImportSettings() {
+        if settingsWindowController == nil { settingsWindowController = SettingsWindowController() }
+        settingsWindowController?.refresh()
+        settingsWindowController?.selectImportPane()
+        settingsWindowController?.showWindow(nil)
+        settingsWindowController?.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func settingsDidChange() {
+        MemoryBudgetController.shared.settingsDidChange()
+        controllers.forEach { $0.settingsDidChange() }
+        if Config.shared.memoryBudgetMB > 0 { MemoryBudgetController.shared.enforceBudget(reason: "settings changed") }
+    }
+
+    func contentBlockingSettingDidChange() {
+        let apply = { [weak self] in self?.controllers.forEach { $0.contentBlockingSettingDidChange() } }
+        if Config.shared.blockAdsAndTrackers { ContentBlocker.load { _ in apply() } }
+        else { apply() }
+    }
+
+    func browserDataWasImported() {
+        rebuildBookmarksMenu()
+        rebuildHistoryMenu()
+        controllers.forEach { $0.showStatus("Browser data imported") }
     }
 
     @objc func openBlocklist() {
@@ -175,7 +227,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self?.front?.showStatus("Couldn\u{2019}t set default: \(err.localizedDescription)")
                 } else {
                     NSWorkspace.shared.setDefaultApplication(at: me, toOpenURLsWithScheme: "https") { _ in }
-                    self?.front?.showStatus("Kestrel is now the default browser")
+                    self?.front?.showStatus("Facet is now the default browser")
                 }
             }
         }
@@ -184,13 +236,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func showAbout() {
         let s = MemoryMonitor.sample()
         let a = NSAlert()
-        a.messageText = "Kestrel"
+        a.messageText = "Facet"
         a.informativeText = """
         A minimal browser on the system WebKit engine.
 
         Right now: \(s.display) across \(s.helperCount + 1) process\(s.helperCount == 0 ? "" : "es").
         Blocking \(ContentBlocker.ruleCount) ad and tracker rules.
         Background tabs sleep after \(Int(Config.shared.hibernateAfterMinutes)) min.
+        Memory target: \(Config.shared.memoryBudgetMB == 0 ? "off" : "\(Config.shared.memoryBudgetMB) MB").
         """
         a.addButton(withTitle: "OK")
         a.runModal()
@@ -261,18 +314,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         // App menu
-        let (_, app) = menu("Kestrel")
-        add(app, "About Kestrel", #selector(showAbout), target: self)
+        let (_, app) = menu("Facet")
+        add(app, "About Facet", #selector(showAbout), target: self)
         app.addItem(.separator())
         add(app, "Settings\u{2026}", #selector(openSettings), ",", target: self)
         add(app, "Edit Blocklist\u{2026}", #selector(openBlocklist), target: self)
-        add(app, "Make Kestrel the Default Browser", #selector(makeDefaultBrowser), target: self)
+        add(app, "Make Facet the Default Browser", #selector(makeDefaultBrowser), target: self)
         app.addItem(.separator())
-        add(app, "Hide Kestrel", #selector(NSApplication.hide(_:)), "h")
+        add(app, "Hide Facet", #selector(NSApplication.hide(_:)), "h")
         add(app, "Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option])
         add(app, "Show All", #selector(NSApplication.unhideAllApplications(_:)))
         app.addItem(.separator())
-        add(app, "Quit Kestrel", #selector(NSApplication.terminate(_:)), "q")
+        add(app, "Quit Facet", #selector(NSApplication.terminate(_:)), "q")
 
         // File
         let (_, file) = menu("File")
@@ -281,6 +334,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add(file, "New Private Window", #selector(newPrivateWindow), "n", [.command, .shift], target: self)
         file.addItem(.separator())
         add(file, "Open Location\u{2026}", #selector(focusAddressBar), "l", target: self)
+        add(file, "Import Browser Data\u{2026}", #selector(openImportSettings), target: self)
         file.addItem(.separator())
         add(file, "Close Tab", #selector(closeTab), "w", target: self)
         add(file, "Reopen Closed Tab", #selector(reopenClosedTab), "t", [.command, .shift], target: self)
@@ -313,6 +367,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add(view, "Zoom Out", #selector(zoomOut), "-", target: self)
         view.addItem(.separator())
         add(view, "Sleep Background Tabs Now", #selector(sleepBackgroundTabs), "h", [.command, .shift], target: self)
+        view.addItem(.separator())
+        add(view, "AI Agent\u{2026}", #selector(showAgent), "k", [.command, .shift], target: self)
         view.addItem(.separator())
         add(view, "Enter Full Screen", #selector(NSWindow.toggleFullScreen(_:)), "f", [.command, .control])
 
