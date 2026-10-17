@@ -388,7 +388,7 @@ private final class ImportSettingsViewController: SettingsPaneViewController {
     private var importSessions: NSButton!
     private let importButton = NSButton(title: "Import Selected Data", target: nil, action: nil)
     private let status = NSTextField(wrappingLabelWithString: "")
-    private let note = NSTextField(wrappingLabelWithString: "Chrome session migration is experimental and best-effort. Saved passwords, passkeys, extensions, and app storage are not imported; some sites will still require login.")
+    private let note = NSTextField(wrappingLabelWithString: "Sign-in migration is experimental and best-effort. Saved passwords, passkeys, extensions, and app storage are not imported; some sites will still require login.")
     private var sources: [BrowserImportSource] = []
     private var isImporting = false
     private var customSources: [BrowserImportSource] = []
@@ -396,7 +396,7 @@ private final class ImportSettingsViewController: SettingsPaneViewController {
 
     init(sourceProvider: @escaping () -> [BrowserImportSource]) {
         self.sourceProvider = sourceProvider
-        super.init(title: "Import", subtitle: "Bring bookmarks, history, and optional Chrome sessions.", symbol: "square.and.arrow.down")
+        super.init(title: "Import", subtitle: "Bring bookmarks, history, and optional sign-in sessions.", symbol: "square.and.arrow.down")
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -404,9 +404,9 @@ private final class ImportSettingsViewController: SettingsPaneViewController {
         super.loadView()
         importBookmarks = checkbox("Bookmarks", action: #selector(selectionChanged))
         importHistory = checkbox("Browsing history", action: #selector(selectionChanged))
-        importSessions = checkbox("Sign-in sessions — Experimental (Chrome only)", action: #selector(selectionChanged))
+        importSessions = checkbox("Sign-in sessions — Experimental", action: #selector(selectionChanged))
         importSessions.state = .off
-        importSessions.toolTip = "Optional, sensitive account data. Requires confirmation and may require macOS Keychain permission. Saved passwords are not imported."
+        importSessions.toolTip = "Optional, sensitive account data from Chromium browsers, Firefox or Safari. Requires confirmation and may require macOS Keychain or Full Disk Access permission. Saved passwords are not imported."
         source.target = self; source.action = #selector(sourceChanged)
         refreshButton.target = self; refreshButton.action = #selector(refreshSources)
         chooseButton.target = self; chooseButton.action = #selector(chooseProfileFolder)
@@ -517,8 +517,8 @@ private final class ImportSettingsViewController: SettingsPaneViewController {
         if c {
             let consent = NSAlert()
             consent.alertStyle = .warning
-            consent.messageText = "Import experimental Chrome sign-in sessions?"
-            consent.informativeText = "From: \(s.displayName)\n\nThis copies supported cookies, including account sign-in tokens and site preferences, into Facet's normal windows. Only import your own profile. Existing Facet cookies are kept; private windows remain separate.\n\nClose Chrome first. macOS may ask permission to read Chrome Safe Storage in Keychain. Facet will not bypass denied access or export plaintext files. Device-bound logins, passkeys, and sites using other storage may still require you to sign in again."
+            consent.messageText = "Import experimental \(s.browserName) sign-in sessions?"
+            consent.informativeText = "From: \(s.displayName)\n\nThis copies supported cookies, including account sign-in tokens and site preferences, into Facet's normal windows. Only import your own profile. Existing Facet cookies are kept; private windows remain separate.\n\nClose \(s.browserName) first. \(ImportOffer.permissionNote(for: s)) Facet will not bypass denied access or export plaintext files. Device-bound logins, passkeys, and sites using other storage may still require you to sign in again."
             consent.addButton(withTitle: "Cancel")
             consent.addButton(withTitle: "Import Sessions")
             guard consent.runModal() == .alertSecondButtonReturn else { setRunning(false); return }
@@ -541,7 +541,7 @@ private final class ImportSettingsViewController: SettingsPaneViewController {
                 self.status.toolTip = text
                 if c {
                     let summary = NSAlert()
-                    summary.messageText = "Chrome session import finished"
+                    summary.messageText = "\(s.browserName) session import finished"
                     summary.informativeText = text
                     summary.addButton(withTitle: "OK")
                     if let window = self.view.window { summary.beginSheetModal(for: window) }

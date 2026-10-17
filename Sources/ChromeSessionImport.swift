@@ -20,24 +20,40 @@ struct ChromeCookieInstallResult {
 
 /// Deliberately narrow adapter, not a password extractor. Secrets remain in memory until
 /// handed to WebKit's normal cookie store. Never log rows, values, keys, or raw crypto errors.
+/// Covers every Chromium browser whose Keychain item Facet knows; Firefox and Safari rows are
+/// converted to the same shape and share the validation below.
 enum ChromeSessionImport {
-    private enum Skipped: Error { case unsupportedEncryption, invalidCookie, expired, partitioned, boundOrigin }
+    enum Skipped: Error { case unsupportedEncryption, invalidCookie, expired, partitioned, boundOrigin }
+
+    static func label(_ reason: Skipped) -> String {
+        switch reason {
+        case .unsupportedEncryption: return "unsupported encryption"
+        case .invalidCookie: return "invalid, unverifiable, or unrepresentable cookies"
+        case .expired: return "expired cookies"
+        case .partitioned: return "partitioned or container cookies"
+        case .boundOrigin: return "origin-bound or conflicting cookies"
+        }
+    }
 
     static func cookieDatabase(in profile: URL) -> URL? {
         ["Network/Cookies", "Cookies"].map { profile.appendingPathComponent($0) }
             .first { FileManager.default.fileExists(atPath: $0.path) }
     }
 
-    /// Called only after explicit session-import consent. Let macOS authorize access; never
-    /// change the source item's ACL, create a replacement key, or bypass a denied prompt.
     static func chromeSafeStoragePassword() throws -> Data {
+        try safeStoragePassword(keyring: "Chrome", browser: "Chrome")
+    }
+
+    /// Called only after explicit session-import consent. Let macOS authorize access; never
+    /// change the source item's ACL, create a replacement key, or bypass a denied prompt. Each
+    /// Chromium browser keeps its own item, "<Name> Safe Storage"; only that one is requested.
+    static func safeStoragePassword(keyring: String, browser: String) throws -> Data {
         let context = LAContext()
-        context.localizedReason = "Allow Facet to import the Chrome sign-in sessions you selected."
+        context.localizedReason = "Allow Facet to import the \(browser) sign-in sessions you selected."
         defer { context.invalidate() }
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "Chrome Safe Storage",
-            kSecAttrAccount as String: "Chrome",
+            kSecAttrService as String: "\(keyring) Safe Storage",
             kSecMatchLimit as String: kSecMatchLimitOne,
             kSecReturnData as String: true,
             kSecUseAuthenticationContext as String: context
@@ -45,7 +61,7 @@ enum ChromeSessionImport {
         var item: CFTypeRef?
         let result = SecItemCopyMatching(query as CFDictionary, &item)
         guard result == errSecSuccess, let password = item as? Data, !password.isEmpty else {
-            throw BrowserImportError.unreadable("Chrome sign-in sessions could not be unlocked. macOS Keychain access was denied or Chrome Safe Storage is unavailable. No protection was bypassed; you may need to sign in again in Facet.")
+            throw BrowserImportError.unreadable("\(browser) sign-in sessions could not be unlocked. macOS Keychain access was denied or \(keyring) Safe Storage is unavailable. No protection was bypassed; you may need to sign in again in Facet.")
         }
         return password
     }
@@ -102,19 +118,21 @@ enum ChromeSessionImport {
     }
 
     static func read(from source: BrowserImportSource,
-                     passwordProvider: () throws -> Data = chromeSafeStoragePassword,
+                     passwordProvider: (() throws -> Data)? = nil,
                      now: Date = Date()) throws -> ChromeCookieBatch {
-        guard source.supportsChromeSessions, let url = source.cookiesURL else {
-            throw BrowserImportError.unreadable("Choose a Google Chrome profile containing a Cookies database. Other browsers' encrypted sign-in data is not supported.")
+        guard source.format == .chromium, let keyring = source.sessionKeyring, let url = source.cookiesURL else {
+            throw BrowserImportError.unreadable("Choose a Chrome, Brave, Edge, Arc, Vivaldi, Opera or Chromium profile containing a Cookies database. Other Chromium browsers' encrypted sign-in data is not supported.")
         }
+        let browser = source.browserName
+        let provide = passwordProvider ?? { try safeStoragePassword(keyring: keyring, browser: browser) }
         let database = try BrowserSQLite(url)
         let meta = try database.query("SELECT value FROM meta WHERE key = 'version';")
         let version = (meta.first?["value"] as? String).flatMap(Int.init) ?? (meta.first?["value"] as? NSNumber)?.intValue ?? 0
-        guard version > 0 else { throw BrowserImportError.invalidFormat("Chrome cookie schema version is missing.") }
+        guard version > 0 else { throw BrowserImportError.invalidFormat("\(browser) cookie schema version is missing.") }
         let columns = Set(try database.query("PRAGMA table_info(cookies);").compactMap { $0["name"] as? String })
         var required = ["host_key", "name", "value", "encrypted_value", "path", "expires_utc", "is_secure", "is_httponly", "samesite", "is_persistent", "has_expires"]
         if version >= 24 { required += ["top_frame_site_key", "source_scheme", "source_port"] }
-        guard Set(required).isSubset(of: columns) else { throw BrowserImportError.invalidFormat("This Chrome cookie schema is not supported.") }
+        guard Set(required).isSubset(of: columns) else { throw BrowserImportError.invalidFormat("This \(browser) cookie schema is not supported.") }
         var selected = required
         for column in ["top_frame_site_key", "is_partitioned", "source_scheme", "source_port"] where columns.contains(column) && !selected.contains(column) { selected.append(column) }
         let total = (try database.query("SELECT COUNT(*) AS total FROM cookies;").first?["total"] as? NSNumber)?.intValue ?? 0
@@ -144,7 +162,7 @@ enum ChromeSessionImport {
                 } else {
                     guard encrypted.starts(with: Data("v10".utf8)) else { throw Skipped.unsupportedEncryption }
                     if key == nil {
-                        var password = try passwordProvider()
+                        var password = try provide()
                         defer { password.resetBytes(in: 0..<password.count) }
                         key = try deriveKey(password: password)
                     }
@@ -155,24 +173,48 @@ enum ChromeSessionImport {
                 cookies.append(cookie)
             } catch let reason as Skipped {
                 skipped += 1
-                let label: String
-                switch reason {
-                case .unsupportedEncryption: label = "unsupported encryption"
-                case .invalidCookie: label = "invalid, unverifiable, or unrepresentable cookies"
-                case .expired: label = "expired cookies"
-                case .partitioned: label = "partitioned cookies"
-                case .boundOrigin: label = "origin-bound or conflicting cookies"
-                }
-                reasons[label, default: 0] += 1
+                reasons[label(reason), default: 0] += 1
             }
             // Keychain failures intentionally escape: denying access never triggers a fallback key.
         }
         var warnings = reasons.sorted { $0.key < $1.key }.map { "Skipped \($0.value) \($0.key)." }
         if total > 5000 { warnings.append("Only the 5,000 most recently relevant cookie records were considered; the remaining \(total - 5000) were skipped.") }
         guard !cookies.isEmpty else {
-            throw BrowserImportError.unreadable("No transferable Chrome sign-in cookies were found. " + warnings.joined(separator: " "))
+            throw BrowserImportError.unreadable("No transferable sign-in cookies were found in \(browser). " + warnings.joined(separator: " "))
         }
         return ChromeCookieBatch(cookies: cookies, skipped: skipped, warnings: warnings)
+    }
+
+    /// Validates plaintext rows already converted to Chrome's shape (Firefox, Safari). A nil row
+    /// is a container or partitioned cookie the source keeps apart, which Facet cannot represent.
+    static func batch(rows: [[String: Any]?], total: Int, browser: String, unreadable: Int = 0,
+                      now: Date = Date()) throws -> ChromeCookieBatch {
+        var cookies: [HTTPCookie] = [], identities = Set<String>(), reasons: [String: Int] = [:]
+        var skipped = max(0, total - rows.count) + unreadable
+        for row in rows {
+            do {
+                guard let row else { throw Skipped.partitioned }
+                guard let value = row["value"] as? String else { throw Skipped.invalidCookie }
+                let cookie = try makeCookie(row: row, value: value, now: now)
+                guard identities.insert(identity(cookie)).inserted else { throw Skipped.boundOrigin }
+                cookies.append(cookie)
+            } catch let reason as Skipped {
+                skipped += 1
+                reasons[label(reason), default: 0] += 1
+            }
+        }
+        var warnings = reasons.sorted { $0.key < $1.key }.map { "Skipped \($0.value) \($0.key)." }
+        if unreadable > 0 { warnings.append("Skipped \(unreadable) unreadable cookie records.") }
+        if total > rows.count { warnings.append("Only the \(rows.count) most recently used cookie records were considered; the remaining \(total - rows.count) were skipped.") }
+        guard !cookies.isEmpty else {
+            throw BrowserImportError.unreadable("No transferable sign-in cookies were found in \(browser). " + warnings.joined(separator: " "))
+        }
+        return ChromeCookieBatch(cookies: cookies, skipped: skipped, warnings: warnings)
+    }
+
+    /// A cookie expiry in Unix seconds, as Chrome's microseconds since 1601.
+    static func chromeTime(_ unixSeconds: Double) -> NSNumber {
+        NSNumber(value: (unixSeconds + 11_644_473_600) * 1_000_000)
     }
 
     /// Deterministic, recency-biased ordering for the bounded cookie import. Chrome schemas

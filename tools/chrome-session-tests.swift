@@ -146,7 +146,9 @@ extension PolishTests {
         do { _ = try ChromeSessionImport.read(from: source, passwordProvider: { keyReads += 1; return Data() }); expect(false, "unsupported-only import must fail") }
         catch { expect(error.localizedDescription.contains("unsupported encryption") && keyReads == 1, "unsupported-only import fails without requesting Keychain") }
         let other = BrowserImportSource(id: "other", browserName: "Brave", profileName: "Default", profileURL: profile, format: .chromium, bookmarksURL: nil, historyURL: nil)
-        expect(!other.hasSessions, "other Chromium profiles cannot use Chrome's key")
+        expect(other.hasSessions && other.sessionKeyring == "Brave", "other Chromium browsers use their own Keychain item")
+        let unknown = BrowserImportSource(id: "unknown", browserName: "Mystery", profileName: "Default", profileURL: profile, format: .chromium, bookmarksURL: nil, historyURL: nil)
+        expect(!unknown.hasSessions, "a Chromium browser with an unknown key is not offered sign-ins")
     }
 
     /// A loopback-only mock site verifies actual authenticated navigation, not just cookie enumeration.
@@ -200,7 +202,7 @@ extension PolishTests {
         // cannot reach Keychain. Profile discovery is injected and never scans real data.
         let profile = root.appendingPathComponent("Chrome/Default")
         let chrome = BrowserImportSource(id: "fixture", browserName: "Google Chrome", profileName: "Fixture", profileURL: profile, format: .chromium, bookmarksURL: nil, historyURL: nil)
-        let other = BrowserImportSource(id: "other", browserName: "Brave", profileName: "Fixture", profileURL: profile, format: .chromium, bookmarksURL: nil, historyURL: nil)
+        let other = BrowserImportSource(id: "other", browserName: "Brave", profileName: "Fixture", profileURL: root.appendingPathComponent("Brave/Default"), format: .chromium, bookmarksURL: nil, historyURL: nil)
         let controller = SettingsWindowController(importSourceProvider: { [chrome, other] })
         controller.selectImportPane(); controller.showWindow(nil)
         defer { controller.close() }

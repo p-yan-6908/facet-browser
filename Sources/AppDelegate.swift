@@ -72,6 +72,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         } else if restoredControllers.isEmpty && c.tabs.isEmpty { c.newTab() }
         isReady = true
         rebuildBookmarksMenu()
+        // After the window is up, so the offer arrives as a sheet on it.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.offerImportIfFirstRun() }
+    }
+
+    /// First launch only: offer to bring data over from the browser this Mac uses.
+    private func offerImportIfFirstRun() {
+        let hasData = !Store.shared.history.isEmpty || !Store.shared.bookmarks.isEmpty
+        guard ImportOffer.shouldOffer(alreadyOffered: Config.shared.importOffered, hasData: hasData,
+                                      environment: ProcessInfo.processInfo.environment) else { return }
+        Config.shared.importOffered = true
+        Config.shared.save()
+        let sources = BrowserImportService.shared.detectSources()
+        guard !sources.isEmpty, let window = front?.window else { return }
+        let offer = ImportOfferController(sources: sources,
+                                          suggested: ImportOffer.suggested(sources, defaultBrowser: ImportOffer.defaultBrowserBundleID()))
+        let sheet = NSWindow(contentViewController: offer)
+        offer.onFinish = { [weak window] in window?.endSheet(sheet) }
+        offer.onImport = { [weak self] choice in self?.runImport(choice) }
+        window.beginSheet(sheet)
+    }
+
+    /// Runs an import chosen in the first-launch offer and reports what came across.
+    func runImport(_ choice: ImportChoice) {
+        let s = choice.source
+        front?.showStatus(choice.signIns ? "Importing from \(s.browserName)\u{2026} check for a macOS permission prompt" : "Importing from \(s.browserName)\u{2026}")
+        BrowserImportService.shared.importData(from: s, bookmarks: choice.bookmarks, history: choice.history, sessions: choice.signIns) { [weak self] result in
+            guard let self else { return }
+            let alert = NSAlert()
+            switch result {
+            case .success(let r):
+                self.browserDataWasImported()
+                alert.messageText = "Imported from \(s.browserName)"
+                var lines = ["\(r.bookmarksAdded) bookmark\(r.bookmarksAdded == 1 ? "" : "s") and \(r.historyAdded) history entr\(r.historyAdded == 1 ? "y" : "ies") added."]
+                if choice.signIns {
+                    lines.append("Signed in to \(r.cookieSites) site\(r.cookieSites == 1 ? "" : "s") (\(r.cookiesImported) cookies). Reload a page that still shows you signed out; some sites will ask you to sign in again.")
+                }
+                alert.informativeText = (lines + r.warnings).joined(separator: "\n\n")
+            case .failure(let error):
+                alert.messageText = "Could not import from \(s.browserName)"
+                alert.informativeText = error.localizedDescription + "\n\nYou can try again from Settings \u{2192} Import."
+            }
+            if let window = self.front?.window { alert.beginSheetModal(for: window) } else { alert.runModal() }
+        }
     }
 
     @discardableResult

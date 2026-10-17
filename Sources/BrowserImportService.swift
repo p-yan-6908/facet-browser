@@ -22,9 +22,39 @@ struct BrowserImportSource: Hashable {
     }
     var hasBookmarks: Bool { bookmarksURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? false }
     var hasHistory: Bool { historyURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? false }
-    var supportsChromeSessions: Bool { format == .chromium && ["Google Chrome", "Chrome"].contains(browserName) }
-    var cookiesURL: URL? { ChromeSessionImport.cookieDatabase(in: profileURL) }
-    var hasSessions: Bool { supportsChromeSessions && cookiesURL != nil }
+    /// The Keychain name a Chromium browser encrypts its cookies with ("Chrome" for "Chrome Safe
+    /// Storage"), when Facet knows it. A profile folder picked by hand is recognised by where it lives.
+    var sessionKeyring: String? {
+        guard format == .chromium else { return nil }
+        let byName = ["Google Chrome": "Chrome", "Chrome": "Chrome", "Brave": "Brave", "Brave-Browser": "Brave",
+                      "Microsoft Edge": "Microsoft Edge", "Chromium": "Chromium", "Arc": "Arc", "Vivaldi": "Vivaldi",
+                      "Opera": "Opera", "com.operasoftware.Opera": "Opera"]
+        if let keyring = byName[browserName] { return keyring }
+        let path = profileURL.path
+        let byPath = [("/Google/Chrome/", "Chrome"), ("/BraveSoftware/", "Brave"), ("/Microsoft Edge/", "Microsoft Edge"),
+                      ("/Chromium/", "Chromium"), ("/Arc/User Data/", "Arc"), ("/Vivaldi/", "Vivaldi"), ("/com.operasoftware.Opera/", "Opera")]
+        return byPath.first { path.contains($0.0) }?.1
+    }
+
+    /// Where this browser keeps cookies. Safari's file sits in its protected container and is
+    /// located only after consent, so detection never touches it.
+    var cookiesURL: URL? {
+        switch format {
+        case .chromium: return ChromeSessionImport.cookieDatabase(in: profileURL)
+        case .firefox:
+            let url = profileURL.appendingPathComponent("cookies.sqlite")
+            return FileManager.default.fileExists(atPath: url.path) ? url : nil
+        case .safari: return nil
+        }
+    }
+
+    var hasSessions: Bool {
+        switch format {
+        case .chromium: return sessionKeyring != nil && cookiesURL != nil
+        case .firefox: return cookiesURL != nil
+        case .safari: return true
+        }
+    }
 }
 
 struct BrowserImportResult {
@@ -120,6 +150,9 @@ final class BrowserImportService {
                                    format: .chromium, bookmarksURL: hasB ? b : nil, historyURL: hasH ? h : nil)
     }
 
+    /// Chromium browsers whose cookie key Facet knows, so a cookie-only profile is still worth listing.
+    private static let keyringBrowsers: Set<String> = ["Google Chrome", "Brave", "Microsoft Edge", "Chromium", "Arc", "Vivaldi", "Opera"]
+
     private func detectChromium(browserName: String, root: URL) -> [BrowserImportSource] {
         guard fm.fileExists(atPath: root.path) else { return [] }
         let friendly = chromiumProfileNames(root: root)
@@ -128,7 +161,7 @@ final class BrowserImportService {
         // Opera-family profiles often store the files directly in the root.
         if fm.fileExists(atPath: root.appendingPathComponent("Bookmarks").path) ||
             fm.fileExists(atPath: root.appendingPathComponent("History").path) ||
-            (browserName == "Google Chrome" && ChromeSessionImport.cookieDatabase(in: root) != nil) {
+            (Self.keyringBrowsers.contains(browserName) && ChromeSessionImport.cookieDatabase(in: root) != nil) {
             profileDirs.append(root)
         }
         if let dirs = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) {
@@ -137,7 +170,7 @@ final class BrowserImportService {
                 guard n == "Default" || n.hasPrefix("Profile ") || n.hasPrefix("Person ") else { continue }
                 if fm.fileExists(atPath: dir.appendingPathComponent("Bookmarks").path) ||
                     fm.fileExists(atPath: dir.appendingPathComponent("History").path) ||
-                    (browserName == "Google Chrome" && ChromeSessionImport.cookieDatabase(in: dir) != nil) { profileDirs.append(dir) }
+                    (Self.keyringBrowsers.contains(browserName) && ChromeSessionImport.cookieDatabase(in: dir) != nil) { profileDirs.append(dir) }
             }
         }
 
@@ -184,7 +217,7 @@ final class BrowserImportService {
                 }
                 var cookieBatch: ChromeCookieBatch?
                 if sessions {
-                    do { cookieBatch = try ChromeSessionImport.read(from: source) }
+                    do { cookieBatch = try SessionImport.read(from: source) }
                     catch { warnings.append("Sign-in sessions: \(error.localizedDescription)") }
                 }
                 guard !bookmarkEntries.isEmpty || !historyEntries.isEmpty || cookieBatch != nil else {

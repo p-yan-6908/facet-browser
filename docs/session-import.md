@@ -1,14 +1,20 @@
-# Chrome sign-in session import (experimental)
+# Sign-in session import (experimental)
 
 ## Use
 
-Close Chrome and avoid browsing in Facet during migration. This feature is **experimental and best-effort**. In **Settings → Import**, choose a Google Chrome profile, explicitly check **Sign-in sessions — Experimental (Chrome only)**, and click **Import Selected Data**. Review the confirmation and choose **Import Sessions**. macOS may request permission to access **Chrome Safe Storage**. Reload sites after completion.
+Facet offers this on first launch, alongside bookmarks and history, for the browser you use; it is also in **Settings → Import**. It is **experimental and best-effort**. Close the source browser and avoid browsing in Facet during migration. In Settings, choose a profile, explicitly check **Sign-in sessions — Experimental**, and click **Import Selected Data**. Review the confirmation and choose **Import Sessions**. Reload sites after completion.
 
-The option is off by default and resets when switching profiles, refreshing, cancelling, or finishing. Cookie-only profiles are supported, including Chrome's `Network/Cookies` and older `Cookies` locations. Custom profile folders must belong to Chrome, not another Chromium browser with a different encryption key.
+| Browser | Source | Protection | Notes |
+|---|---|---|---|
+| Google Chrome, Brave, Microsoft Edge, Arc, Vivaldi, Opera, Chromium | `Network/Cookies` or `Cookies` (SQLite) | `v10` AES-128-CBC with the browser's own Keychain item: `Chrome Safe Storage`, `Brave Safe Storage`, `Microsoft Edge Safe Storage`, `Arc Safe Storage`, `Vivaldi Safe Storage`, `Opera Safe Storage`, `Chromium Safe Storage` | A hand-picked profile folder is recognised by its location. Opera GX, Aside and unknown Chromium browsers are not offered sign-ins. |
+| Firefox | `cookies.sqlite` (`moz_cookies`) | none (plaintext) | Container, partitioned and other non-default `originAttributes` cookies are skipped. Expiry in seconds or milliseconds is accepted. Unset or `None` SameSite becomes Lax. |
+| Safari | `Cookies.binarycookies` in `~/Library/Containers/com.apple.Safari/Data/Library/Cookies/` (or `~/Library/Cookies/` on older macOS) | macOS Full Disk Access | Located only after consent, so detection never touches Safari's container. The file records no SameSite, so it becomes Lax. Damaged records are counted and skipped; a damaged file is refused. |
+
+The option is off by default in Settings and resets when switching profiles, refreshing, cancelling, or finishing. The first-launch sheet ticks it when the suggested browser has sign-ins, names what is copied, and says which macOS permission may be requested; choosing **Import** there is the consent.
 
 ## Implemented acceptance checks
 
-- Explicit opt-in plus confirmation precedes reading cookie rows or requesting Keychain access. Only Chrome's named Safe Storage item is requested; no key creation, ACL modification, fallback key, or protection bypass is implemented.
+- Explicit opt-in plus confirmation precedes reading cookie rows or requesting Keychain access: in Settings, an off-by-default checkbox and a consent dialog; on first launch, the import sheet that names what is copied and what macOS will ask. Only the chosen browser's own Safe Storage item is requested, by service name; no key creation, ACL modification, fallback key, or protection bypass is implemented.
 - A short-lived read-only SQLite transaction reads metadata, schema, and committed WAL rows consistently. No temporary plaintext exports are written. The adapter supports macOS `v10` AES-128-CBC, PBKDF2-HMAC-SHA1 (`saltysalt`, 1003 rounds), and verifies schema-v24+ SHA256 host binding.
 - Domain/path, Secure, HttpOnly, expiry, and session-only lifetime are retained. Explicit SameSite None/Lax/Strict are represented; unspecified Chrome SameSite is tightened to Lax because WebKit maps a nil Foundation policy to None. Foundation's Secure/Discard presence-flag behavior is explicitly handled.
 - Expired, partitioned, malformed, unknown-encryption, nonstandard-port, and HTTP-source-bound records are skipped. HTTPS source metadata never becomes an insecure cookie. At most 5,000 records are considered; when the profile is larger, Facet deterministically prioritizes the most recently accessed/updated records using the recency columns available in that Chrome schema, then applies stable scope/name tie-breakers. Additional skipped records are counted.
@@ -23,7 +29,7 @@ This is a best-effort migration between engines, not a clone of Chrome's securit
 
 ## Verification
 
-- `bash tools/run-polish-tests.sh --webkit`: **162/162 checks passed** (all prior polish checks plus migration tests).
+- `bash tools/run-polish-tests.sh --webkit`: **381/381 checks passed**, including the Chromium, Firefox and Safari sign-in fixtures in `tools/session-import-tests.swift`.
 - Independent OpenSSL PBKDF2 vector; v23/v24/newer host-bound crypto fixtures; wrong key/host/version and malformed ciphertext rejection.
 - Synthetic WAL-backed cookie-only profiles; one injected key lookup; denied-access and unsupported-only failures; no Keychain request for plaintext-only data; source database/WAL bytes unchanged.
 - Nonpersistent WebKit round trips for SameSite, security flags, expiry, session lifetime, and host-only scope; repeated imports and conflicting account tokens preserve existing cookies.

@@ -351,26 +351,37 @@ copy of your history is written. If a database is locked or inaccessible, close 
 browser and retry. Partial imports identify the failed category; fully failed imports are
 reported as failures. Custom profiles remain selectable when refreshing the pane.
 
-#### Keep Chrome sites signed in (experimental, best effort)
+#### Stay signed in: sign-ins from other browsers (experimental, best effort)
 
-1. Close Chrome. Avoid browsing in Facet while importing.
-2. Open **Settings → Import**, select your **Google Chrome** profile, and explicitly enable
-   **Sign-in sessions — Experimental (Chrome only)**. This is off by default.
-3. Click **Import Selected Data**, review the sensitive-data warning, and confirm
-   **Import Sessions**. macOS may ask you to authorize access to **Chrome Safe Storage**.
-4. Reload your sites in Facet. The result reports imported cookies, existing cookies kept,
-   and skipped records—not a guaranteed number of signed-in accounts.
+On first launch, Facet looks for the browsers on your Mac and offers to bring over
+bookmarks, history and sign-ins from the one you use (your default browser's most recently
+used profile is suggested). Nothing is read until you choose **Import**, and you can do it
+again at any time from **Settings → Import**. The offer appears once, to a profile with no
+history or bookmarks yet; set `FACET_SHOW_IMPORT_OFFER=1` to see it again.
 
-This experimental feature transfers supported cookies (including sign-in tokens and site preferences) into normal
-Facet windows. Existing Facet cookies are preserved instead of overwriting another account;
-private windows stay separate. No plaintext export files are created, and denied Keychain access
-or unsupported encryption is never bypassed. Expired, partitioned, invalid, and known unsupported
-origin-bound cookies are skipped.
+Sign-ins come across as the browser's cookies:
+
+| Browser | Where they come from | What macOS asks |
+|---|---|---|
+| Chrome, Brave, Edge, Arc, Vivaldi, Opera, Chromium | the profile's encrypted `Cookies` database | Keychain access to that browser's own *Safe Storage* item |
+| Firefox | the profile's `cookies.sqlite` | nothing; Firefox stores them unencrypted |
+| Safari | `Cookies.binarycookies` in Safari's container | Full Disk Access for Facet, if not already granted |
+
+In **Settings → Import**, sign-ins stay opt-in: tick **Sign-in sessions — Experimental**,
+click **Import Selected Data**, and confirm **Import Sessions**. Close the source browser
+first. Then reload your sites in Facet. The result reports imported cookies, existing cookies
+kept, and skipped records, not a guaranteed number of signed-in accounts.
+
+This experimental feature transfers supported cookies (including sign-in tokens and site
+preferences) into normal Facet windows. Existing Facet cookies are preserved instead of
+overwriting another account; private windows stay separate. No plaintext export files are
+created, and denied Keychain or disk access is never bypassed. Expired, partitioned,
+Firefox-container, invalid, and known unsupported origin-bound cookies are skipped.
 
 **Some sites will still require login or MFA.** Saved passwords alone do not keep a browser
-signed in. This feature does **not** import a password vault, passkeys, device-bound credentials,
-localStorage/IndexedDB, extensions, or autofill data. WebKit's cookie policies differ from Chrome's;
-this is not a complete clone of Chrome's profile or per-port isolation. See
+signed in, and Facet does **not** import a password vault, passkeys, device-bound credentials,
+localStorage/IndexedDB, extensions, or autofill data. WebKit's cookie policies differ from the
+other engines'; this is not a clone of another browser's profile. See
 [`docs/session-import.md`](docs/session-import.md) for compatibility details.
 
 Safari's Library data is protected by macOS and may require granting Facet Full Disk Access
