@@ -39,6 +39,7 @@ final class PageBridge: NSObject, WKScriptMessageHandler {
         const image = t && t.tagName === 'IMG' ? (t.currentSrc || t.src || '') : '';
         post({t: 'context', href: linkFor(t), image, selection: String(getSelection() || '').slice(0, 4000)});
       }, {capture: true});
+    \(PasswordForms.captureJS)
     })();
     """
 

@@ -19,6 +19,9 @@ final class Config {
     var showBookmarksBar: Bool = false
     /// Set once the first-launch import offer has been shown, whatever the answer.
     var importOffered: Bool = false
+    /// Offer to save website logins, and fill saved ones on matching pages.
+    var savePasswords: Bool = true
+    var autofillPasswords: Bool = true
 
     /// App-global target. 0 disables budget enforcement.
     var memoryBudgetMB: Int = 1536
@@ -81,6 +84,8 @@ final class Config {
         if let v = d["enableDeveloperTools"] as? Bool { enableDeveloperTools = v }
         if let v = d["showBookmarksBar"] as? Bool { showBookmarksBar = v }
         if let v = d["importOffered"] as? Bool { importOffered = v }
+        if let v = d["savePasswords"] as? Bool { savePasswords = v }
+        if let v = d["autofillPasswords"] as? Bool { autofillPasswords = v }
         if let v = d["memoryBudgetMB"] as? Int { memoryBudgetMB = max(0, v) }
         if let v = d["agentEnabled"] as? Bool { agentEnabled = v }
         if let v = d["agentProvider"] as? String { agentProvider = v }
@@ -109,6 +114,8 @@ final class Config {
             "enableDeveloperTools": enableDeveloperTools,
             "showBookmarksBar": showBookmarksBar,
             "importOffered": importOffered,
+            "savePasswords": savePasswords,
+            "autofillPasswords": autofillPasswords,
             "memoryBudgetMB": memoryBudgetMB,
             "agentEnabled": agentEnabled,
             "agentProvider": agentProvider,

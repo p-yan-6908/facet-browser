@@ -77,6 +77,18 @@ final class SiteSettings {
         scheduleSave()
     }
 
+    /// "Never save for this site" is stored like a denied permission.
+    func isSavePasswordSuppressed(for url: URL?) -> Bool {
+        guard let host = Self.key(for: url) else { return false }
+        return permission("save-password", for: host) == false
+    }
+
+    func setSavePasswordSuppressed(_ suppressed: Bool, for url: URL?) {
+        guard let host = Self.key(for: url) else { return }
+        if suppressed { setPermission("save-password", for: host, allowed: false) }
+        else { clearPermission("save-password", for: host) }
+    }
+
     func resetPermissions() {
         permissions.removeAll()
         scheduleSave()

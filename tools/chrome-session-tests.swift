@@ -226,7 +226,7 @@ extension PolishTests {
         var sawConsent = false
         DispatchQueue.main.async {
             if let modal = NSApp.modalWindow {
-                sawConsent = descendants(modal.contentView!).compactMap { $0 as? NSTextField }.contains { $0.stringValue.contains("account sign-in tokens") }
+                sawConsent = descendants(modal.contentView!).compactMap { $0 as? NSTextField }.contains { $0.stringValue.contains("account tokens") }
                 NSApp.stopModal(withCode: .alertFirstButtonReturn)
             } else { NSApp.abortModal() }
         }

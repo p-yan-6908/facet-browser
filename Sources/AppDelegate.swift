@@ -97,7 +97,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     func runImport(_ choice: ImportChoice) {
         let s = choice.source
         front?.showStatus(choice.signIns ? "Importing from \(s.browserName)\u{2026} check for a macOS permission prompt" : "Importing from \(s.browserName)\u{2026}")
-        BrowserImportService.shared.importData(from: s, bookmarks: choice.bookmarks, history: choice.history, sessions: choice.signIns) { [weak self] result in
+        BrowserImportService.shared.importData(from: s, bookmarks: choice.bookmarks, history: choice.history, sessions: choice.signIns, passwords: choice.passwords) { [weak self] result in
             guard let self else { return }
             let alert = NSAlert()
             switch result {
@@ -107,6 +107,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
                 var lines = ["\(r.bookmarksAdded) bookmark\(r.bookmarksAdded == 1 ? "" : "s") and \(r.historyAdded) history entr\(r.historyAdded == 1 ? "y" : "ies") added."]
                 if choice.signIns {
                     lines.append("Signed in to \(r.cookieSites) site\(r.cookieSites == 1 ? "" : "s") (\(r.cookiesImported) cookies). Reload a page that still shows you signed out; some sites will ask you to sign in again.")
+                }
+                if choice.passwords {
+                    lines.append("Imported \(r.passwordsImported) saved password\(r.passwordsImported == 1 ? "" : "s"). They are now in the macOS Keychain and will fill in on their sites.")
                 }
                 alert.informativeText = (lines + r.warnings).joined(separator: "\n\n")
             case .failure(let error):
@@ -341,6 +344,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         if settingsWindowController == nil { settingsWindowController = SettingsWindowController() }
         settingsWindowController?.refresh()
         settingsWindowController?.selectImportPane()
+        settingsWindowController?.showWindow(nil)
+        settingsWindowController?.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc func openPasswordSettings() {
+        if settingsWindowController == nil { settingsWindowController = SettingsWindowController() }
+        settingsWindowController?.refresh()
+        settingsWindowController?.selectPasswordsPane()
         settingsWindowController?.showWindow(nil)
         settingsWindowController?.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -616,6 +628,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         add(app, "About Facet", #selector(showAbout), target: self)
         app.addItem(.separator())
         add(app, "Settings\u{2026}", #selector(openSettings), ",", target: self)
+        add(app, "Passwords\u{2026}", #selector(openPasswordSettings), target: self)
         add(app, "Edit Blocklist\u{2026}", #selector(openBlocklist), target: self)
         add(app, "Make Facet the Default Browser", #selector(makeDefaultBrowser), target: self)
         app.addItem(.separator())

@@ -1257,6 +1257,24 @@ extension BrowserWindowController: TabDelegate {
         askAssistant(prompt)
     }
 
+    /// A login was submitted: offer to save or update it, unless it is already saved unchanged
+    /// or the site was declined. Only the visible tab prompts.
+    func tab(_ tab: Tab, didSubmitLogin username: String, password: String, on url: URL) {
+        guard tab === activeTab, !SiteSettings.shared.isSavePasswordSuppressed(for: url) else { return }
+        let decision = PasswordStore.shared.decision(url: url, username: username, password: password)
+        guard decision != .ignore else { return }
+        let host = PasswordStore.key(for: url) ?? url.host ?? ""
+        let prompt = PasswordPromptController(host: host, username: username, password: password,
+                                              mode: decision == .update ? .update : .save)
+        prompt.onSave = { [weak self] name, secret in
+            PasswordStore.shared.save(url: url, username: name, password: secret)
+            self?.showStatus(decision == .update ? "Password updated" : "Password saved")
+        }
+        prompt.onNever = { SiteSettings.shared.setSavePasswordSuppressed(true, for: url) }
+        prompt.onFinish = { [weak self] in self?.transientPopover?.close() }
+        present(prompt, from: bookmarkButton.bounds, in: bookmarkButton, behavior: .semitransient)
+    }
+
     func tabRequestsAttention(_ tab: Tab) {
         guard let idx = tabs.firstIndex(where: { $0 === tab }), idx != activeIndex else { return }
         selectTab(index: idx)

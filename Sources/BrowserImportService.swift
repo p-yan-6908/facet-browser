@@ -55,6 +55,10 @@ struct BrowserImportSource: Hashable {
         case .safari: return true
         }
     }
+
+    /// Saved passwords come only from a Chromium browser whose key Facet knows.
+    var loginDataURL: URL? { format == .chromium ? ChromePasswordImport.loginDatabase(in: profileURL) : nil }
+    var hasPasswords: Bool { format == .chromium && sessionKeyring != nil && loginDataURL != nil }
 }
 
 struct BrowserImportResult {
@@ -67,6 +71,8 @@ struct BrowserImportResult {
     var cookiesPreserved = 0
     var cookiesSkipped = 0
     var cookieSites = 0
+    var passwordsImported = 0
+    var passwordsSkipped = 0
 }
 
 enum BrowserImportError: LocalizedError {
@@ -142,7 +148,8 @@ final class BrowserImportService {
         let b = profileURL.appendingPathComponent("Bookmarks")
         let h = profileURL.appendingPathComponent("History")
         let hasB = fm.fileExists(atPath: b.path), hasH = fm.fileExists(atPath: h.path)
-        guard hasB || hasH || ChromeSessionImport.cookieDatabase(in: profileURL) != nil else { return nil }
+        guard hasB || hasH || ChromeSessionImport.cookieDatabase(in: profileURL) != nil
+              || ChromePasswordImport.loginDatabase(in: profileURL) != nil else { return nil }
         let browser = profileURL.deletingLastPathComponent().lastPathComponent.isEmpty
             ? "Chromium browser" : profileURL.deletingLastPathComponent().lastPathComponent
         return BrowserImportSource(id: "custom:\(profileURL.path)", browserName: browser,
@@ -206,6 +213,7 @@ final class BrowserImportService {
     }
 
     func importData(from source: BrowserImportSource, bookmarks: Bool, history: Bool, sessions: Bool = false,
+                    passwords: Bool = false,
                     completion: @escaping (Result<BrowserImportResult, Error>) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             do {
@@ -220,7 +228,13 @@ final class BrowserImportService {
                     do { cookieBatch = try SessionImport.read(from: source) }
                     catch { warnings.append("Sign-in sessions: \(error.localizedDescription)") }
                 }
-                guard !bookmarkEntries.isEmpty || !historyEntries.isEmpty || cookieBatch != nil else {
+                var passwordBatch: PasswordImportBatch?
+                if passwords {
+                    do { passwordBatch = try ChromePasswordImport.read(from: source) }
+                    catch { warnings.append("Passwords: \(error.localizedDescription)") }
+                }
+                if let passwordBatch { warnings.append(contentsOf: passwordBatch.warnings) }
+                guard !bookmarkEntries.isEmpty || !historyEntries.isEmpty || cookieBatch != nil || passwordBatch != nil else {
                     if warnings.isEmpty { throw BrowserImportError.noData }
                     throw BrowserImportError.unreadable(warnings.joined(separator: " "))
                 }
@@ -232,6 +246,11 @@ final class BrowserImportService {
                     var result = BrowserImportResult(bookmarksAdded: bAdded, historyAdded: hAdded,
                                                      bookmarksRead: bookmarkEntries.count, historyRead: historyEntries.count,
                                                      warnings: warnings)
+                    if let passwordBatch {
+                        let added = passwordBatch.logins.filter { PasswordStore.shared.saveImported(host: $0.host, username: $0.username, password: $0.password, updated: $0.updated) }.count
+                        result.passwordsImported = added
+                        result.passwordsSkipped = passwordBatch.skipped + (passwordBatch.logins.count - added)
+                    }
                     guard let cookieBatch else { completion(.success(result)); return }
                     ChromeSessionImport.install(cookieBatch.cookies, into: WKWebsiteDataStore.default().httpCookieStore) { installed in
                         result.cookiesImported = installed.imported

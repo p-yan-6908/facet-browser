@@ -9,6 +9,7 @@ protocol TabDelegate: AnyObject {
     func tab(_ tab: Tab, didHoverLink url: URL?)
     func tab(_ tab: Tab, openInNewWindow url: URL, isPrivate: Bool)
     func tab(_ tab: Tab, askAssistant prompt: String)
+    func tab(_ tab: Tab, didSubmitLogin username: String, password: String, on url: URL)
     /// A background tab needs the user (a JavaScript dialog), so bring it forward.
     func tabRequestsAttention(_ tab: Tab)
     func presentingWindow(for tab: Tab) -> NSWindow?
@@ -18,6 +19,7 @@ extension TabDelegate {
     func tab(_ tab: Tab, didHoverLink url: URL?) {}
     func tab(_ tab: Tab, openInNewWindow url: URL, isPrivate: Bool) {}
     func tab(_ tab: Tab, askAssistant prompt: String) {}
+    func tab(_ tab: Tab, didSubmitLogin username: String, password: String, on url: URL) {}
     func tabRequestsAttention(_ tab: Tab) {}
     func presentingWindow(for tab: Tab) -> NSWindow? { nil }
 }
@@ -429,6 +431,12 @@ final class Tab: NSObject {
         case "context":
             let selection = (body["selection"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             pageContext = PageContext(link: url("href"), image: url("image"), selection: selection, at: Date())
+        case "login":
+            guard !isPrivate, Config.shared.savePasswords, let u = webView?.url ?? self.url,
+                  let scheme = u.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return }
+            let password = body["p"] as? String ?? ""
+            guard !password.isEmpty else { return }
+            delegate?.tab(self, didSubmitLogin: body["u"] as? String ?? "", password: password, on: u)
         default:
             break
         }
@@ -1042,8 +1050,19 @@ extension Tab: WKNavigationDelegate {
             }
             fetchFavicon(for: webView)
             refreshSemanticCache(in: webView)
+            autofillSavedLogin(in: webView)
         }
         delegate?.tabDidChangeState(self)
+    }
+
+    /// Fills the most recently saved login for this site, if any, into the page's login form.
+    /// Reads the password from the Keychain only when there is a form to fill.
+    private func autofillSavedLogin(in webView: WKWebView) {
+        guard !isPrivate, Config.shared.autofillPasswords, let u = webView.url,
+              let best = PasswordStore.shared.logins(for: u).first,
+              let password = PasswordStore.shared.password(for: u, username: best.username) else { return }
+        webView.evaluateJavaScript(PasswordForms.fillJS(username: best.username, password: password),
+                                   in: nil, in: .defaultClient, completionHandler: { _ in })
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {

@@ -233,6 +233,11 @@ The things people reach for in Chrome, done natively and without extra processes
   page, rename in place, New Folder, Delete, and search. Open All opens the first page and
   leaves the rest as sleeping tabs that use no memory until you click them. Folder menus are
   built only when opened, so a large imported collection costs almost nothing.
+- **Passwords.** When you sign in to a site, Facet offers to save the login (**Save**,
+  **Update**, **Never**, or **Not Now**); on your next visit it fills the username and
+  password in. Passwords are kept in the **macOS Keychain**, never in Facet's files, and are
+  never synced off the Mac. Revealing or copying one in **Facet → Passwords…** asks Touch ID
+  or your login password first. Turn saving or filling off there, or decline a site for good.
 - **Per-site memory.** Zoom uses Chrome's steps and is remembered per site. Camera and
   microphone decisions can be remembered per site. Pages that try to open another app
   (`zoommtg:`, `mailto:`, ...) ask first, with an "always allow" option.
@@ -367,9 +372,11 @@ Sign-ins come across as the browser's cookies:
 | Firefox | the profile's `cookies.sqlite` | nothing; Firefox stores them unencrypted |
 | Safari | `Cookies.binarycookies` in Safari's container | Full Disk Access for Facet, if not already granted |
 
-In **Settings → Import**, sign-ins stay opt-in: tick **Sign-in sessions — Experimental**,
-click **Import Selected Data**, and confirm **Import Sessions**. Close the source browser
-first. Then reload your sites in Facet. The result reports imported cookies, existing cookies
+In **Settings → Import**, sign-ins and saved passwords stay opt-in: tick **Sign-in sessions —
+Experimental** and/or **Saved passwords — Experimental (Chromium)**, click **Import Selected
+Data**, and confirm. Close the source browser first. Then reload your sites in Facet. Imported
+passwords go to the macOS Keychain and fill in like any login you saved yourself; only
+Chromium browsers' passwords can be read. The result reports imported cookies, existing cookies
 kept, and skipped records, not a guaranteed number of signed-in accounts.
 
 This experimental feature transfers supported cookies (including sign-in tokens and site
@@ -410,6 +417,8 @@ uses a loopback-only test site and a nonpersistent WebKit store. See
 | `showMemoryReadout` | `true` | |
 | `enableDeveloperTools` | `true` | |
 | `showBookmarksBar` | `false` | also **View → Always Show Bookmarks Bar** (⌘⇧B) |
+| `savePasswords` | `true` | offer to save website logins to the macOS Keychain |
+| `autofillPasswords` | `true` | fill saved logins on their sign-in pages |
 | `memoryBudgetMB` | `1536` | app-global RAM target; `0` disables enforcement |
 | `agentEnabled` | `true` | enable the native AI agent sidebar (has no effect while the agent is parked) |
 | `agentProvider` | `openai` | `openai`, `anthropic`, `openai_oauth`, or `anthropic_oauth` |
@@ -458,6 +467,10 @@ a throwaway profile folder instead.
 | `Sources/PageInfo.swift` | the lock's site information popover, per-site data clearing |
 | `Sources/RecentlyClosed.swift` | closed tabs and windows for ⌘⇧T and History → Recently Closed |
 | `Sources/SiteSettings.swift` | per-site zoom and permission memory |
+| `Sources/PasswordStore.swift` | saved logins in the macOS Keychain |
+| `Sources/PasswordForms.swift` | isolated-world login detection and autofill scripts |
+| `Sources/PasswordPrompt.swift` | the save/update password bubble |
+| `Sources/ChromePasswordImport.swift` | decrypt and import a Chromium browser's saved passwords |
 | `Sources/FaviconStore.swift` | bounded in-memory and on-disk favicon cache |
 | `Sources/StartView.swift` | native new-tab page |
 | `Sources/Store.swift` | history, bookmarks, session (flat JSON) |
@@ -475,9 +488,11 @@ a throwaway profile folder instead.
 - **Not a new engine.** Site compatibility is Safari's. The rare site that only
   works in Chrome will not work here.
 - **No extension support.** Ad blocking is built in; anything else is not available.
-- **No password manager, autofill, sync, or web notifications.** WKWebView does not expose
-  iCloud Keychain AutoFill or Web Push to third-party browsers, and Facet does not store
-  passwords itself.
+- **No web notifications.** WKWebView does not expose Web Push to third-party browsers.
+- **Passwords stay on this Mac.** Facet saves logins to the macOS Keychain but does not sync
+  them, fill across devices, or read iCloud Keychain (Safari's passwords). It can import saved
+  passwords from a Chromium browser (Chrome, Brave, Edge, Arc, Vivaldi, Opera, Chromium);
+  Firefox's and Safari's are kept where a third-party browser cannot read them.
 - **Dragging the only tab of a window does not move the window**, as Chrome's does. Drag the
   window by its tab strip instead.
 - **Local builds are ad-hoc signed.** Tagged GitHub releases are notarized only when the

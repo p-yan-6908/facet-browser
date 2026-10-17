@@ -53,6 +53,7 @@ struct ImportChoice {
     let bookmarks: Bool
     let history: Bool
     let signIns: Bool
+    let passwords: Bool
 }
 
 /// The first-launch sheet: which browser, and what to bring.
@@ -63,6 +64,7 @@ final class ImportOfferController: NSViewController {
     let bookmarks = NSButton(checkboxWithTitle: "Bookmarks", target: nil, action: nil)
     let history = NSButton(checkboxWithTitle: "Browsing history", target: nil, action: nil)
     let signIns = NSButton(checkboxWithTitle: "Stay signed in to websites", target: nil, action: nil)
+    let passwords = NSButton(checkboxWithTitle: "Saved passwords", target: nil, action: nil)
     let signInNote = NSTextField(wrappingLabelWithString: "")
     let importButton = NSButton(title: "Import", target: nil, action: nil)
     var onImport: ((ImportChoice) -> Void)?
@@ -88,7 +90,7 @@ final class ImportOfferController: NSViewController {
         signInNote.font = .systemFont(ofSize: 11)
         signInNote.textColor = .secondaryLabelColor
         signInNote.preferredMaxLayoutWidth = 380
-        for box in [bookmarks, history, signIns] { box.target = self; box.action = #selector(selectionChanged) }
+        for box in [bookmarks, history, signIns, passwords] { box.target = self; box.action = #selector(selectionChanged) }
         let from = NSStackView(views: [NSTextField(labelWithString: "Import from:"), sourcePopup])
         let notNow = NSButton(title: "Not Now", target: self, action: #selector(notNow))
         notNow.keyEquivalent = "\u{1b}"
@@ -98,7 +100,7 @@ final class ImportOfferController: NSViewController {
         let buttons = NSStackView(views: [NSView(), notNow, importButton])
         let noteRow = NSStackView(views: [signInNote])
         noteRow.edgeInsets = NSEdgeInsets(top: 0, left: 20, bottom: 0, right: 0)
-        let stack = NSStackView(views: [title, intro, from, bookmarks, history, signIns, noteRow, buttons])
+        let stack = NSStackView(views: [title, intro, from, bookmarks, history, signIns, passwords, noteRow, buttons])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 10
@@ -124,6 +126,8 @@ final class ImportOfferController: NSViewController {
         history.state = s.hasHistory ? .on : .off
         signIns.isEnabled = s.hasSessions
         signIns.state = s.hasSessions ? .on : .off
+        passwords.isEnabled = s.hasPasswords
+        passwords.state = s.hasPasswords ? .on : .off
         signInNote.stringValue = s.hasSessions
             ? "Copies \(s.browserName)'s sign-in cookies, including account tokens, so sites you use there stay signed in here. Passwords are not copied. Close \(s.browserName) first. \(ImportOffer.permissionNote(for: s))"
             : "Facet cannot read \(s.browserName)'s sign-ins."
@@ -133,8 +137,9 @@ final class ImportOfferController: NSViewController {
     var choice: ImportChoice? {
         guard let s = selectedSource else { return nil }
         let c = ImportChoice(source: s, bookmarks: bookmarks.state == .on && bookmarks.isEnabled,
-                             history: history.state == .on && history.isEnabled, signIns: signIns.state == .on && signIns.isEnabled)
-        return c.bookmarks || c.history || c.signIns ? c : nil
+                             history: history.state == .on && history.isEnabled, signIns: signIns.state == .on && signIns.isEnabled,
+                             passwords: passwords.state == .on && passwords.isEnabled)
+        return c.bookmarks || c.history || c.signIns || c.passwords ? c : nil
     }
 
     @objc private func selectionChanged() { importButton.isEnabled = choice != nil }

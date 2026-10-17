@@ -19,6 +19,7 @@ final class SettingsWindowController: NSWindowController {
         tabs.addChild(MemorySettingsViewController())
         if Config.agentFeatureAvailable { tabs.addChild(AgentSettingsViewController()) }
         tabs.addChild(ImportSettingsViewController(sourceProvider: importSourceProvider))
+        tabs.addChild(PasswordsSettingsViewController())
         tabs.addChild(PrivacySettingsViewController())
         w.contentViewController = tabs
     }
@@ -33,6 +34,10 @@ final class SettingsWindowController: NSWindowController {
 
     func selectImportPane() {
         if let i = tabs.children.firstIndex(where: { $0 is ImportSettingsViewController }) { tabs.selectedTabViewItemIndex = i }
+    }
+
+    func selectPasswordsPane() {
+        if let i = tabs.children.firstIndex(where: { $0 is PasswordsSettingsViewController }) { tabs.selectedTabViewItemIndex = i }
     }
 }
 
@@ -386,6 +391,7 @@ private final class ImportSettingsViewController: SettingsPaneViewController {
     private var importBookmarks: NSButton!
     private var importHistory: NSButton!
     private var importSessions: NSButton!
+    private var importPasswords: NSButton!
     private let importButton = NSButton(title: "Import Selected Data", target: nil, action: nil)
     private let status = NSTextField(wrappingLabelWithString: "")
     private let note = NSTextField(wrappingLabelWithString: "Sign-in migration is experimental and best-effort. Saved passwords, passkeys, extensions, and app storage are not imported; some sites will still require login.")
@@ -406,7 +412,10 @@ private final class ImportSettingsViewController: SettingsPaneViewController {
         importHistory = checkbox("Browsing history", action: #selector(selectionChanged))
         importSessions = checkbox("Sign-in sessions — Experimental", action: #selector(selectionChanged))
         importSessions.state = .off
-        importSessions.toolTip = "Optional, sensitive account data from Chromium browsers, Firefox or Safari. Requires confirmation and may require macOS Keychain or Full Disk Access permission. Saved passwords are not imported."
+        importSessions.toolTip = "Optional, sensitive account data from Chromium browsers, Firefox or Safari. Requires confirmation and may require macOS Keychain or Full Disk Access permission."
+        importPasswords = checkbox("Saved passwords \u{2014} Experimental (Chromium)", action: #selector(selectionChanged))
+        importPasswords.state = .off
+        importPasswords.toolTip = "Optional, sensitive. Saved passwords from a Chromium browser (Chrome, Brave, Edge, Arc, Vivaldi, Opera, Chromium) are decrypted with that browser's Keychain item and kept in your macOS Keychain. Firefox and Safari passwords cannot be read."
         source.target = self; source.action = #selector(sourceChanged)
         refreshButton.target = self; refreshButton.action = #selector(refreshSources)
         chooseButton.target = self; chooseButton.action = #selector(chooseProfileFolder)
@@ -414,7 +423,7 @@ private final class ImportSettingsViewController: SettingsPaneViewController {
         [refreshButton, chooseButton, importButton].forEach { $0.bezelStyle = .rounded }
         status.font = .systemFont(ofSize: 12); status.textColor = .secondaryLabelColor
         note.font = .systemFont(ofSize: 11); note.textColor = .tertiaryLabelColor
-        [source, refreshButton, chooseButton, importBookmarks!, importHistory!, importSessions!, importButton, status, note].forEach { content.addSubview($0) }
+        [source, refreshButton, chooseButton, importBookmarks!, importHistory!, importSessions!, importPasswords!, importButton, status, note].forEach { content.addSubview($0) }
         refreshSources()
     }
 
@@ -426,11 +435,12 @@ private final class ImportSettingsViewController: SettingsPaneViewController {
         source.frame = NSRect(x: 140, y: 296, width: max(220, w - 240), height: 28)
         refreshButton.frame = NSRect(x: w - 88, y: 296, width: 88, height: 28)
         chooseButton.frame = NSRect(x: 140, y: 254, width: max(210, w - 140), height: 28)
-        importBookmarks.frame = NSRect(x: 140, y: 220, width: 180, height: 24)
-        importHistory.frame = NSRect(x: 140, y: 188, width: 180, height: 24)
-        importSessions.frame = NSRect(x: 140, y: 156, width: max(300, w - 140), height: 24)
-        importButton.frame = NSRect(x: 140, y: 112, width: 160, height: 30)
-        status.frame = NSRect(x: 0, y: 54, width: w, height: 48)
+        importBookmarks.frame = NSRect(x: 140, y: 230, width: 180, height: 24)
+        importHistory.frame = NSRect(x: 140, y: 204, width: 180, height: 24)
+        importSessions.frame = NSRect(x: 140, y: 178, width: max(300, w - 140), height: 24)
+        importPasswords.frame = NSRect(x: 140, y: 152, width: max(300, w - 140), height: 24)
+        importButton.frame = NSRect(x: 140, y: 110, width: 160, height: 30)
+        status.frame = NSRect(x: 0, y: 50, width: w, height: 48)
         note.frame = NSRect(x: 0, y: 6, width: w, height: 38)
     }
 
@@ -469,6 +479,8 @@ private final class ImportSettingsViewController: SettingsPaneViewController {
     @objc private func sourceChanged() {
         importSessions.state = .off // A different profile or refresh always requires a fresh opt-in.
         importSessions.isEnabled = !isImporting && (selectedSource?.hasSessions ?? false)
+        importPasswords.state = .off
+        importPasswords.isEnabled = !isImporting && (selectedSource?.hasPasswords ?? false)
         guard let s = selectedSource else {
             importBookmarks.isEnabled = false; importHistory.isEnabled = false; importButton.isEnabled = false
             return
@@ -485,7 +497,7 @@ private final class ImportSettingsViewController: SettingsPaneViewController {
     @objc private func selectionChanged() {
         importButton.isEnabled = !isImporting && selectedSource != nil &&
             ((importBookmarks.state == .on && importBookmarks.isEnabled) || (importHistory.state == .on && importHistory.isEnabled) ||
-             (importSessions.state == .on && importSessions.isEnabled))
+             (importSessions.state == .on && importSessions.isEnabled) || (importPasswords.state == .on && importPasswords.isEnabled))
     }
 
     @objc private func chooseProfileFolder() {
@@ -512,20 +524,22 @@ private final class ImportSettingsViewController: SettingsPaneViewController {
         let b = importBookmarks.state == .on && importBookmarks.isEnabled
         let h = importHistory.state == .on && importHistory.isEnabled
         let c = importSessions.state == .on && importSessions.isEnabled
-        guard b || h || c else { return }
+        let pw = importPasswords.state == .on && importPasswords.isEnabled
+        guard b || h || c || pw else { return }
         setRunning(true)
-        if c {
+        if c || pw {
+            let what = [c ? "sign-in sessions" : nil, pw ? "saved passwords" : nil].compactMap { $0 }.joined(separator: " and ")
             let consent = NSAlert()
             consent.alertStyle = .warning
-            consent.messageText = "Import experimental \(s.browserName) sign-in sessions?"
-            consent.informativeText = "From: \(s.displayName)\n\nThis copies supported cookies, including account sign-in tokens and site preferences, into Facet's normal windows. Only import your own profile. Existing Facet cookies are kept; private windows remain separate.\n\nClose \(s.browserName) first. \(ImportOffer.permissionNote(for: s)) Facet will not bypass denied access or export plaintext files. Device-bound logins, passkeys, and sites using other storage may still require you to sign in again."
+            consent.messageText = "Import experimental \(s.browserName) \(what)?"
+            consent.informativeText = "From: \(s.displayName)\n\nThis copies sensitive account data into Facet: \(c ? "sign-in cookies (account tokens and preferences) into Facet's normal windows" : "")\(c && pw ? ", and " : "")\(pw ? "saved passwords into your macOS Keychain" : ""). Only import your own profile. Existing Facet data is kept; private windows remain separate.\n\nClose \(s.browserName) first. \(ImportOffer.permissionNote(for: s)) Facet will not bypass denied access or export plaintext files. Device-bound logins and sites using other storage may still require you to sign in again."
             consent.addButton(withTitle: "Cancel")
-            consent.addButton(withTitle: "Import Sessions")
+            consent.addButton(withTitle: "Import")
             guard consent.runModal() == .alertSecondButtonReturn else { setRunning(false); return }
         }
-        status.stringValue = "Importing from \(s.displayName)…" + (c ? " Check for a macOS Keychain permission prompt." : "")
+        status.stringValue = "Importing from \(s.displayName)…" + ((c || pw) ? " Check for a macOS Keychain permission prompt." : "")
         status.toolTip = status.stringValue
-        BrowserImportService.shared.importData(from: s, bookmarks: b, history: h, sessions: c) { [weak self] result in
+        BrowserImportService.shared.importData(from: s, bookmarks: b, history: h, sessions: c, passwords: pw) { [weak self] result in
             guard let self else { return }
             self.setRunning(false)
             switch result {
@@ -535,6 +549,9 @@ private final class ImportSettingsViewController: SettingsPaneViewController {
                 if r.bookmarksRead > r.bookmarksAdded || r.historyRead > r.historyAdded { text += " Existing items were merged without duplication." }
                 if c {
                     text += " \(r.cookiesImported) cookies imported across \(r.cookieSites) hosts; \(r.cookiesPreserved) existing cookies kept; \(r.cookiesSkipped) skipped. Reload your sites. Some sites will still require login."
+                }
+                if pw {
+                    text += " \(r.passwordsImported) saved password\(r.passwordsImported == 1 ? "" : "s") imported to the macOS Keychain; \(r.passwordsSkipped) skipped."
                 }
                 if !r.warnings.isEmpty { text += " " + r.warnings.joined(separator: " ") }
                 self.status.stringValue = text
@@ -559,8 +576,146 @@ private final class ImportSettingsViewController: SettingsPaneViewController {
         importBookmarks.isEnabled = !running && (selectedSource?.hasBookmarks ?? false)
         importHistory.isEnabled = !running && (selectedSource?.hasHistory ?? false)
         importSessions.isEnabled = !running && (selectedSource?.hasSessions ?? false)
-        if !running { importSessions.state = .off }
+        importPasswords.isEnabled = !running && (selectedSource?.hasPasswords ?? false)
+        if !running { importSessions.state = .off; importPasswords.state = .off }
         selectionChanged()
+    }
+}
+
+private final class PasswordsSettingsViewController: SettingsPaneViewController, NSTableViewDataSource, NSTableViewDelegate {
+    private var offerSave: NSButton!
+    private var autofill: NSButton!
+    private let table = NSTableView()
+    private let scroll = NSScrollView()
+    private let revealButton = NSButton(title: "Reveal\u{2026}", target: nil, action: nil)
+    private let copyButton = NSButton(title: "Copy Password", target: nil, action: nil)
+    private let deleteButton = NSButton(title: "Delete", target: nil, action: nil)
+    private let empty = NSTextField(wrappingLabelWithString: "Passwords you save appear here. They are kept in the macOS Keychain, not in Facet's files, and are never synced.")
+    private var logins: [SavedLogin] = []
+    /// Rows revealed this session, by "host\nuser", cleared when the window closes.
+    private var revealed: [String: String] = [:]
+    private var observer: NSObjectProtocol?
+
+    init() { super.init(title: "Passwords", subtitle: "Saved website logins, kept in the macOS Keychain.", symbol: "key") }
+    required init?(coder: NSCoder) { fatalError() }
+
+    deinit { if let observer { NotificationCenter.default.removeObserver(observer) } }
+
+    override func loadView() {
+        super.loadView()
+        offerSave = checkbox("Offer to save passwords", action: #selector(changed))
+        autofill = checkbox("Fill saved passwords on sign-in pages", action: #selector(changed))
+        for (id, title, width) in [("site", "Site", 230.0), ("user", "Username", 200.0), ("pw", "Password", 160.0)] {
+            let c = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id)); c.title = title; c.width = width
+            table.addTableColumn(c)
+        }
+        table.dataSource = self; table.delegate = self
+        table.usesAlternatingRowBackgroundColors = true
+        table.rowHeight = 22
+        table.target = self
+        table.doubleAction = #selector(revealPressed)
+        scroll.documentView = table; scroll.hasVerticalScroller = true; scroll.borderType = .bezelBorder
+        empty.font = .systemFont(ofSize: 12); empty.textColor = .secondaryLabelColor
+        revealButton.target = self; revealButton.action = #selector(revealPressed)
+        copyButton.target = self; copyButton.action = #selector(copyPressed)
+        deleteButton.target = self; deleteButton.action = #selector(deletePressed)
+        [revealButton, copyButton, deleteButton].forEach { $0.bezelStyle = .rounded }
+        [offerSave!, autofill!, scroll, empty, revealButton, copyButton, deleteButton].forEach { content.addSubview($0) }
+        observer = NotificationCenter.default.addObserver(forName: .facetPasswordsChanged, object: nil, queue: .main) { [weak self] _ in self?.reload() }
+        reloadFromConfig()
+        reload()
+    }
+
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        guard isViewLoaded else { return }
+        let w = content.bounds.width
+        offerSave.frame = NSRect(x: 0, y: 300, width: w, height: 22)
+        autofill.frame = NSRect(x: 0, y: 274, width: w, height: 22)
+        scroll.frame = NSRect(x: 0, y: 44, width: w, height: 218)
+        empty.frame = NSRect(x: 8, y: 150, width: w - 16, height: 40)
+        deleteButton.frame = NSRect(x: w - 90, y: 8, width: 90, height: 28)
+        copyButton.frame = NSRect(x: w - 230, y: 8, width: 135, height: 28)
+        revealButton.frame = NSRect(x: w - 320, y: 8, width: 85, height: 28)
+    }
+
+    override func reloadFromConfig() {
+        guard isViewLoaded else { return }
+        offerSave.state = Config.shared.savePasswords ? .on : .off
+        autofill.state = Config.shared.autofillPasswords ? .on : .off
+        reload()
+    }
+
+    @objc private func changed() {
+        Config.shared.savePasswords = offerSave.state == .on
+        Config.shared.autofillPasswords = autofill.state == .on
+        commit()
+    }
+
+    private func reload() {
+        logins = PasswordStore.shared.allLogins()
+        empty.isHidden = !logins.isEmpty
+        scroll.isHidden = logins.isEmpty
+        table.reloadData()
+        updateButtons()
+    }
+
+    private var selected: SavedLogin? { logins.indices.contains(table.selectedRow) ? logins[table.selectedRow] : nil }
+    private func revealKey(_ l: SavedLogin) -> String { "\(l.host)\n\(l.username)" }
+
+    private func updateButtons() {
+        let has = selected != nil
+        revealButton.isEnabled = has; copyButton.isEnabled = has; deleteButton.isEnabled = has
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) { updateButtons() }
+    func numberOfRows(in tableView: NSTableView) -> Int { logins.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard let id = tableColumn?.identifier, logins.indices.contains(row) else { return nil }
+        let login = logins[row]
+        let cell = tableView.makeView(withIdentifier: id, owner: self) as? NSTableCellView ?? {
+            let c = NSTableCellView(); c.identifier = id
+            let t = NSTextField(labelWithString: ""); t.lineBreakMode = .byTruncatingTail
+            t.translatesAutoresizingMaskIntoConstraints = false; c.addSubview(t); c.textField = t
+            NSLayoutConstraint.activate([t.leadingAnchor.constraint(equalTo: c.leadingAnchor, constant: 2),
+                                         t.trailingAnchor.constraint(equalTo: c.trailingAnchor, constant: -2),
+                                         t.centerYAnchor.constraint(equalTo: c.centerYAnchor)])
+            return c
+        }()
+        switch id.rawValue {
+        case "site": cell.textField?.stringValue = login.host
+        case "user": cell.textField?.stringValue = login.username
+        default:
+            let shown = revealed[revealKey(login)]
+            cell.textField?.stringValue = shown ?? "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}"
+            cell.textField?.font = shown != nil ? .monospacedSystemFont(ofSize: 12, weight: .regular) : .systemFont(ofSize: 12)
+        }
+        return cell
+    }
+
+    @objc private func revealPressed() {
+        guard let login = selected else { return }
+        if revealed[revealKey(login)] != nil { revealed[revealKey(login)] = nil; table.reloadData(); return }
+        PasswordStore.shared.authenticateToReveal(reason: "reveal the saved password for \(login.host)") { [weak self] ok in
+            guard let self, ok, let pw = PasswordStore.shared.password(for: URL(string: "https://\(login.host)"), username: login.username) else { return }
+            self.revealed[self.revealKey(login)] = pw
+            self.table.reloadData()
+        }
+    }
+
+    @objc private func copyPressed() {
+        guard let login = selected else { return }
+        PasswordStore.shared.authenticateToReveal(reason: "copy the saved password for \(login.host)") { ok in
+            guard ok, let pw = PasswordStore.shared.password(for: URL(string: "https://\(login.host)"), username: login.username) else { return }
+            NSPasteboard.general.clearContents(); NSPasteboard.general.setString(pw, forType: .string)
+        }
+    }
+
+    @objc private func deletePressed() {
+        guard let login = selected else { return }
+        PasswordStore.shared.remove(host: login.host, username: login.username)
+        revealed[revealKey(login)] = nil
     }
 }
 
