@@ -8,11 +8,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     /// URLs can arrive from LaunchServices before the first window exists (clicking a
     /// link while Facet is closed), so hold them until the window is up.
     private var isReady = false
+    private(set) var isTerminating = false
     private var pendingURLs: [URL] = []
     private let bookmarksMenu = NSMenu(title: "Bookmarks")
     private let historyMenu = NSMenu(title: "History")
+    private var fileMenu: NSMenu?
+    private var sharePicker: NSSharingServicePicker?
+    private static let shareTag = 7_001
     private var settingsWindowController: SettingsWindowController?
     private var libraryWindowController: LibraryWindowController?
+    private var taskManager: TaskManagerWindowController?
 
     var allControllers: [BrowserWindowController] { controllers }
 
@@ -105,6 +110,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        isTerminating = true
         saveApplicationSession()
         Store.shared.flush()
         SiteSettings.shared.flush()
@@ -145,7 +151,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     @objc func newWindow() { makeWindow().newTab() }
     @objc func newPrivateWindow() { makeWindow(isPrivate: true).newTab() }
     @objc func closeTab() { front?.closeActiveTab() }
-    @objc func reopenClosedTab() { front?.reopenClosedTab() }
+    /// ⌘⇧T: the most recently closed tab or window, as in Chrome.
+    @objc func reopenClosedTab() {
+        guard let item = RecentlyClosed.shared.popLast() else { front?.showStatus("No recently closed tabs"); return }
+        reopen(item)
+    }
+
+    @objc func reopenRecentlyClosed(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID, let item = RecentlyClosed.shared.remove(id: id) else { return }
+        reopen(item)
+    }
+
+    /// Tabs go back to the window they came from while it is open, otherwise to the front
+    /// normal window. Closed tabs are never reopened into a private window.
+    func reopen(_ item: RecentlyClosed.Item) {
+        switch item.entry {
+        case .tab(let saved):
+            let home = item.window.flatMap { w in controllers.contains { $0 === w } ? w : nil }
+            let fallback = front.flatMap { $0.isPrivateWindow ? nil : $0 } ?? controllers.last { !$0.isPrivateWindow }
+            let target = home ?? fallback ?? makeWindow()
+            target.reopen(saved)
+            target.window?.makeKeyAndOrderFront(nil)
+        case .window(let saved):
+            let c = makeWindow(show: false)
+            c.restore(saved: saved.tabs, activeIndex: saved.activeIndex)
+            if let frame = saved.frame { c.window?.setFrame(frame, display: false) }
+            c.showWindow(nil)
+            c.window?.makeKeyAndOrderFront(nil)
+        }
+    }
     @objc func focusAddressBar() { front?.focusURLField() }
     @objc func reload() { front?.reload() }
     @objc func hardReload() { front?.hardReload() }
@@ -162,6 +196,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         Config.shared.showBookmarksBar.toggle()
         Config.shared.save()
         controllers.forEach { $0.chromeLayoutDidChange() }
+    }
+
+    @objc func searchTabs() { front?.showTabSearch() }
+
+    @objc func showTaskManager() {
+        if taskManager == nil { taskManager = TaskManagerWindowController() }
+        taskManager?.show()
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     @objc func showHistory() { showLibrary(.history) }
@@ -201,6 +243,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             return tab != nil
         case #selector(duplicateTab):
             return tab?.url != nil
+        case #selector(reopenClosedTab):
+            return !RecentlyClosed.shared.items.isEmpty
         case #selector(moveTabToNewWindow):
             return (front?.tabs.count ?? 0) > 1
         case #selector(printPage), #selector(savePageAs), #selector(exportPDF), #selector(useSelectionForFind):
@@ -301,6 +345,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         a.addButton(withTitle: "Cancel")
         guard a.runModal() == .alertFirstButtonReturn else { return }
         Store.shared.clearHistory()
+        RecentlyClosed.shared.removeAll()
         rebuildHistoryMenu()
         front?.showStatus("History cleared")
     }
@@ -340,6 +385,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         if history.state == .on {
             if window == nil { Store.shared.clearHistory(); FaviconStore.shared.clearAll() }
             else { Store.shared.clearHistory(since: since) }
+            RecentlyClosed.shared.removeAll()
             rebuildHistoryMenu()
         }
         if site.state == .on { SiteSettings.shared.resetAll() }
@@ -439,7 +485,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         add("Forward", #selector(goForward), "]")
         historyMenu.addItem(.separator())
         add("Show All History", #selector(showHistory), "y")
-        add("Reopen Closed Tab", #selector(reopenClosedTab), "t", [.command, .shift])
+        let lastClosed = RecentlyClosed.shared.items.last
+        add(lastClosed.map { if case .window = $0.entry { return "Reopen Closed Window" } else { return "Reopen Closed Tab" } } ?? "Reopen Closed Tab",
+            #selector(reopenClosedTab), "t", [.command, .shift])
+        let recent = NSMenu(title: "Recently Closed")
+        for item in RecentlyClosed.shared.items.reversed() {
+            let entry = NSMenuItem(title: String(item.title.prefix(60)), action: #selector(reopenRecentlyClosed(_:)), keyEquivalent: "")
+            entry.target = self
+            entry.representedObject = item.id
+            recent.addItem(entry)
+        }
+        let recentItem = NSMenuItem(title: "Recently Closed", action: nil, keyEquivalent: "")
+        recentItem.submenu = recent
+        recentItem.isEnabled = !recent.items.isEmpty
+        historyMenu.addItem(recentItem)
         historyMenu.addItem(.separator())
         for e in Store.shared.recentHistory(limit: 15) {
             let title = e.title.isEmpty ? Store.displayForm(e.url) : e.title
@@ -500,6 +559,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         add(file, "Save Page As\u{2026}", #selector(savePageAs), "s", target: self)
         add(file, "Export as PDF\u{2026}", #selector(exportPDF), target: self)
         add(file, "Print\u{2026}", #selector(printPage), "p", target: self)
+        let share = NSMenuItem(title: "Share", action: nil, keyEquivalent: "")
+        share.tag = Self.shareTag
+        file.addItem(share)
+        fileMenu = file
+        file.delegate = self
         file.addItem(.separator())
         add(file, "Downloads", #selector(showDownloads), "j", [.command, .shift], target: self)
         add(file, "Open Downloads Folder", #selector(openDownloadsFolder), "l", [.command, .option], target: self)
@@ -519,6 +583,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         add(edit, "Find Next", #selector(findNext), "g", target: self)
         add(edit, "Find Previous", #selector(findPrevious), "g", [.command, .shift], target: self)
         add(edit, "Use Selection for Find", #selector(useSelectionForFind), "e", target: self)
+        // The standard Mac text submenus. Web pages answer these selectors through WebKit.
+        func submenu(_ title: String) -> NSMenu {
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            let m = NSMenu(title: title)
+            item.submenu = m
+            edit.addItem(item)
+            return m
+        }
+        edit.addItem(.separator())
+        let spelling = submenu("Spelling and Grammar")
+        add(spelling, "Show Spelling and Grammar", #selector(NSText.showGuessPanel(_:)), ":")
+        add(spelling, "Check Document Now", #selector(NSText.checkSpelling(_:)), ";")
+        spelling.addItem(.separator())
+        add(spelling, "Check Spelling While Typing", #selector(NSTextView.toggleContinuousSpellChecking(_:)))
+        add(spelling, "Check Grammar With Spelling", #selector(NSTextView.toggleGrammarChecking(_:)))
+        add(spelling, "Correct Spelling Automatically", #selector(NSTextView.toggleAutomaticSpellingCorrection(_:)))
+        let substitutions = submenu("Substitutions")
+        add(substitutions, "Show Substitutions", #selector(NSTextView.orderFrontSubstitutionsPanel(_:)))
+        substitutions.addItem(.separator())
+        add(substitutions, "Smart Copy/Paste", #selector(NSTextView.toggleSmartInsertDelete(_:)))
+        add(substitutions, "Smart Quotes", #selector(NSTextView.toggleAutomaticQuoteSubstitution(_:)))
+        add(substitutions, "Smart Dashes", #selector(NSTextView.toggleAutomaticDashSubstitution(_:)))
+        add(substitutions, "Smart Links", #selector(NSTextView.toggleAutomaticLinkDetection(_:)))
+        add(substitutions, "Text Replacement", #selector(NSTextView.toggleAutomaticTextReplacement(_:)))
+        let transformations = submenu("Transformations")
+        add(transformations, "Make Upper Case", #selector(NSResponder.uppercaseWord(_:)))
+        add(transformations, "Make Lower Case", #selector(NSResponder.lowercaseWord(_:)))
+        add(transformations, "Capitalize", #selector(NSResponder.capitalizeWord(_:)))
+        let speech = submenu("Speech")
+        add(speech, "Start Speaking", #selector(NSTextView.startSpeaking(_:)))
+        add(speech, "Stop Speaking", #selector(NSTextView.stopSpeaking(_:)))
 
         // View
         let (_, view) = menu("View")
@@ -554,6 +649,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         // Tab
         let (_, tabMenu) = menu("Tab")
         add(tabMenu, "New Tab", #selector(newTab), target: self)
+        add(tabMenu, "Search Tabs\u{2026}", #selector(searchTabs), "a", [.command, .shift], target: self)
         add(tabMenu, "Duplicate Tab", #selector(duplicateTab), target: self)
         add(tabMenu, "Pin Tab", #selector(togglePinTab), target: self)
         add(tabMenu, "Mute Tab", #selector(toggleMuteTab), target: self)
@@ -565,6 +661,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         let (windowItem, windowMenu) = menu("Window")
         add(windowMenu, "Minimize", #selector(NSWindow.performMiniaturize(_:)), "m")
         add(windowMenu, "Zoom", #selector(NSWindow.performZoom(_:)))
+        windowMenu.addItem(.separator())
+        add(windowMenu, "Task Manager", #selector(showTaskManager), target: self)
         windowMenu.addItem(.separator())
         add(windowMenu, "Show Next Tab", #selector(nextTab), "\u{0009}", [.control], target: self)
         add(windowMenu, "Show Previous Tab", #selector(previousTab), "\u{0009}", [.control, .shift], target: self)
@@ -588,5 +686,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     /// Refresh the history submenu lazily when it is opened, not on every page load.
     func menuNeedsUpdate(_ menu: NSMenu) {
         if menu === historyMenu { rebuildHistoryMenu() }
+        if menu === fileMenu { refreshShareItem(in: menu) }
+    }
+
+    /// File → Share is rebuilt as the menu opens, for whatever page is in front.
+    private func refreshShareItem(in menu: NSMenu) {
+        guard let i = menu.items.firstIndex(where: { $0.tag == Self.shareTag }) else { return }
+        let item: NSMenuItem
+        if let url = front?.activeTab?.url {
+            let picker = NSSharingServicePicker(items: [url])
+            sharePicker = picker
+            item = picker.standardShareMenuItem
+        } else {
+            sharePicker = nil
+            item = NSMenuItem(title: "Share", action: nil, keyEquivalent: "")
+        }
+        item.tag = Self.shareTag
+        menu.removeItem(at: i)
+        menu.insertItem(item, at: i)
     }
 }

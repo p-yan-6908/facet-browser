@@ -210,7 +210,18 @@ The things people reach for in Chrome, done natively and without extra processes
 - **Tabs.** Pin tabs (they persist), mute tabs from the speaker icon, open links next to
   the page that opened them, return to the opener when you close its last child tab, move a
   tab to a new window without reloading it, close tabs to the right, and duplicate a tab with
-  its history. Hold or right-click Back/Forward to see the history list.
+  its history. Drag a tab off the strip to give it its own window, or onto another window's
+  strip to move it there; the page moves live, without reloading. **Search Tabs** (⌘⇧A) finds
+  any open tab by title or address across windows, sleeping tabs included, without waking
+  them. ⌘⇧T reopens closed windows as well as tabs, and **History → Recently Closed** lists
+  both. Hold or right-click Back/Forward to see the history list.
+- **Task Manager.** **Window → Task Manager**, or a click on the memory pill, lists the browser,
+  every tab with the memory its WebKit process is using, and the helpers all tabs share. Select
+  tabs to **Sleep** or **Close** them. Hovering a tab shows its site and memory, like Chrome's
+  hover cards. The Task Manager samples only while it is open, every two seconds.
+- **Site information.** Click the lock in the address bar for the connection's security and
+  certificate, the permissions you gave the site (set each to Allow, Block or Ask), ad
+  blocking for that site, its zoom, and **Clear Cookies and Site Data** for that site alone.
 - **Finding things.** Find as you type, with a match count. ⌘E finds the current selection.
   History (⌘Y) and Bookmarks (⌥⌘B) open in a native, searchable window where you can delete
   entries and rename bookmarks. A bookmarks bar (⌘⇧B) has an overflow menu.
@@ -223,7 +234,10 @@ The things people reach for in Chrome, done natively and without extra processes
   in New Tab/Window/Private Window, and search the selection with your engine. Error pages
   name the host, and Reload retries the real address. Repeated JavaScript dialogs can be
   suppressed, and a page crashing in a loop stops reloading itself. Private windows share
-  one ephemeral session, like incognito, which is discarded when the last one closes.
+  one ephemeral session, like incognito, which is discarded when the last one closes. The
+  address bar's menu has **Paste and Go** (or **Paste and Search**), **File → Share** sends
+  the page to AirDrop, Messages or Mail, and **Edit** has the standard Spelling and Grammar,
+  Substitutions, Transformations and Speech menus.
 
 The link-hover and context-menu details come from a script in WebKit's isolated
 `defaultClient` world. Page scripts see the same DOM events but cannot reach its message
@@ -271,7 +285,8 @@ To make it your default browser: **Facet → Make Facet the Default Browser**.
 | `⌘L` | address bar (inline completion, open tabs, bookmarks, history; no network suggestions) |
 | `⌘Return` (in the address bar) | open in a new tab |
 | `⌘T` / `⌘W` | new tab / close tab |
-| `⌘⇧T` | reopen the tab you just closed |
+| `⌘⇧T` | reopen the tab or window you just closed |
+| `⌘⇧A` | search open tabs |
 | `⌘N` / `⌘⇧N` | new window / new private window |
 | `^⇥` / `^⇧⇥` | next / previous tab (also `⌘⌥→` / `⌘⌥←`) |
 | `⌘1`–`⌘9` | jump to tab |
@@ -414,6 +429,10 @@ a throwaway profile folder instead.
 | `Sources/Downloads.swift` / `DownloadsView.swift` | download tracking, quarantine, toolbar popover |
 | `Sources/BookmarksBar.swift` | bookmarks bar |
 | `Sources/LibraryWindowController.swift` | native History and Bookmarks window |
+| `Sources/TaskManagerWindowController.swift` | per-tab memory, Sleep and Close |
+| `Sources/TabSearch.swift` | ⌘⇧A tab search across windows |
+| `Sources/PageInfo.swift` | the lock's site information popover, per-site data clearing |
+| `Sources/RecentlyClosed.swift` | closed tabs and windows for ⌘⇧T and History → Recently Closed |
 | `Sources/SiteSettings.swift` | per-site zoom and permission memory |
 | `Sources/FaviconStore.swift` | bounded in-memory and on-disk favicon cache |
 | `Sources/StartView.swift` | native new-tab page |
@@ -435,7 +454,8 @@ a throwaway profile folder instead.
 - **No password manager, autofill, sync, or web notifications.** WKWebView does not expose
   iCloud Keychain AutoFill or Web Push to third-party browsers, and Facet does not store
   passwords itself.
-- **No drag-a-tab-out.** Use **Move Tab to New Window** instead.
+- **Dragging the only tab of a window does not move the window**, as Chrome's does. Drag the
+  window by its tab strip instead.
 - **Local builds are ad-hoc signed.** Tagged GitHub releases are notarized only when the
   repository has the required Apple Developer secrets configured; see `docs/releasing.md`.
 - Cosmetic ad rules are deliberately conservative, so some blocked slots leave a gap.

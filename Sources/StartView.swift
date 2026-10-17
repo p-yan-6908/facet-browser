@@ -183,6 +183,25 @@ final class SiteTileView: NSView {
 /// URL field that gives the page its focus back on Escape and selects all on focus.
 final class URLField: NSTextField {
     var onCancel: (() -> Void)?
+    /// Runs Paste and Go / Paste and Search with the clipboard text.
+    var onPasteAndGo: ((String) -> Void)?
+    var pasteboard = NSPasteboard.general
+
+    static func pasteAndGoTitle(for text: String) -> String {
+        Config.shared.isSearchQuery(text) ? "Paste and Search" : "Paste and Go"
+    }
+
+    /// Chrome's Paste and Go, added to the editing menu right after Paste. Line breaks are
+    /// dropped, so an address that wrapped where it was copied still opens.
+    @objc(textView:menu:forEvent:atIndex:)
+    func textView(_ view: NSTextView, menu: NSMenu, for event: NSEvent, at charIndex: Int) -> NSMenu? {
+        guard let onPasteAndGo, let raw = pasteboard.string(forType: .string) else { return menu }
+        let text = raw.components(separatedBy: .newlines).joined().trimmingCharacters(in: .whitespaces)
+        guard !text.isEmpty else { return menu }
+        let at = menu.items.firstIndex { $0.action == #selector(NSText.paste(_:)) }.map { $0 + 1 } ?? 0
+        menu.insertItem(ClosureMenuItem(Self.pasteAndGoTitle(for: text)) { onPasteAndGo(text) }, at: at)
+        return menu
+    }
 
     override func cancelOperation(_ sender: Any?) { onCancel?() }
 

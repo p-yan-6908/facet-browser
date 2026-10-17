@@ -60,7 +60,6 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     private var hiddenSince: Date?
     private var observers: [NSObjectProtocol] = []
     /// Most recently closed tabs, for Reopen Closed Tab.
-    private var closedTabs: [SavedTab] = []
 
     private let tabRowHeight: CGFloat = 36
     private let toolRowHeight: CGFloat = 38
@@ -178,6 +177,13 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         urlField.target = self
         urlField.action = #selector(urlFieldCommitted)
         urlField.onCancel = { [weak self] in self?.revertAddressBar() }
+        statusPill.onClick = { AppDelegate.shared?.showTaskManager() }
+        urlBar.onSiteInfo = { [weak self] in self?.showPageInfo() }
+        urlField.onPasteAndGo = { [weak self] text in
+            guard let self else { return }
+            self.urlField.stringValue = text
+            self.urlFieldCommitted()
+        }
         omnibox.onActivate = { [weak self] index in self?.activateSuggestion(at: index) }
 
         [backButton, forwardButton, reloadButton, urlBar, bookmarkButton,
@@ -337,6 +343,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         omnibox.hide()
         saveSessionNow()
+        if AppDelegate.shared?.isTerminating != true, let closing = sessionSnapshot() {
+            RecentlyClosed.shared.add(window: closing)
+        }
         hibernationTimer?.invalidate()
         memoryTimer?.invalidate()
         observers.forEach { NotificationCenter.default.removeObserver($0) }
@@ -432,10 +441,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     func closeTab(index: Int) {
         guard tabs.indices.contains(index) else { return }
         let tab = tabs[index]
-        if tab.url != nil, !isPrivateWindow {
-            closedTabs.append(tab.snapshot())
-            if closedTabs.count > 25 { closedTabs.removeFirst() }
-        }
+        if tab.url != nil, !isPrivateWindow { RecentlyClosed.shared.add(tab: tab.snapshot(), from: self) }
         let wasActive = index == activeIndex
         tab.webView?.removeFromSuperview()
         tab.hibernate()
@@ -466,11 +472,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     private func close(_ victims: [Tab]) {
         let keep = activeTab
         for tab in victims {
-            if tab.url != nil, !isPrivateWindow { closedTabs.append(tab.snapshot()) }
+            if tab.url != nil, !isPrivateWindow { RecentlyClosed.shared.add(tab: tab.snapshot(), from: self) }
             tab.webView?.removeFromSuperview()
             tab.hibernate()
         }
-        if closedTabs.count > 25 { closedTabs.removeFirst(closedTabs.count - 25) }
         tabs.removeAll { t in victims.contains { $0 === t } }
         guard !tabs.isEmpty else { saveSessionNow(); window?.close(); return }
         activeIndex = keep.flatMap { k in tabs.firstIndex { $0 === k } } ?? min(activeIndex, tabs.count - 1)
@@ -479,12 +484,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         scheduleSessionSave()
     }
 
-    /// Restores the last closed tab with its history and scroll position intact.
-    @objc func reopenClosedTab() {
-        guard let saved = closedTabs.popLast() else {
-            showStatus("No recently closed tabs")
-            return
-        }
+    /// Restores a closed tab with its history and scroll position intact.
+    func reopen(_ saved: SavedTab) {
         let tab = Tab(saved: saved, delegate: self)
         let index = tab.isPinned ? pinnedCount : tabs.count
         tabs.insert(tab, at: index)
@@ -520,23 +521,67 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
 
     /// Hands a live tab to a brand-new window without reloading it.
     func moveTabToNewWindow(_ tab: Tab) {
-        guard tabs.count > 1, let i = tabs.firstIndex(where: { $0 === tab }), let app = AppDelegate.shared else {
+        guard tabs.count > 1, tabs.contains(where: { $0 === tab }), let app = AppDelegate.shared else {
             showStatus("This is the only tab in the window"); return
         }
+        detach(tab)
+        app.makeBrowserWindow(isPrivate: isPrivateWindow).adopt(tab)
+    }
+
+    /// Dropping a dragged-out tab on another window's tab strip moves it there; anywhere else
+    /// it gets a window of its own under the pointer. Either way the page moves live.
+    func moveTab(_ tab: Tab, toScreenPoint point: NSPoint) {
+        let others = NSApp.orderedWindows.compactMap { $0.windowController as? BrowserWindowController }
+            .filter { $0 !== self && $0.isPrivateWindow == isPrivateWindow }
+        for target in others {
+            guard let at = target.tabStripIndex(atScreenPoint: point) else { continue }
+            detach(tab)
+            target.adopt(tab, at: at)
+            target.window?.makeKeyAndOrderFront(nil)
+            return
+        }
+        guard tabs.count > 1, let app = AppDelegate.shared else { return }
+        detach(tab)
+        let c = app.makeBrowserWindow(isPrivate: isPrivateWindow)
+        c.adopt(tab)
+        c.window?.setFrameTopLeftPoint(NSPoint(x: point.x - 80, y: point.y + 14))
+    }
+
+    /// Where on this window's tab strip a tab dropped at a screen point would land, if it
+    /// is over the strip at all.
+    func tabStripIndex(atScreenPoint point: NSPoint) -> Int? {
+        guard let window, window.isVisible, window.frame.contains(point) else { return nil }
+        let local = tabStrip.convert(window.convertPoint(fromScreen: point), from: nil)
+        guard tabStrip.bounds.insetBy(dx: 0, dy: -8).contains(local) else { return nil }
+        return tabStrip.insertionIndex(atX: local.x)
+    }
+
+    /// The tab strip's frame in screen coordinates.
+    var tabStripScreenFrame: NSRect? {
+        guard let window else { return nil }
+        return window.convertToScreen(tabStrip.convert(tabStrip.bounds, to: nil))
+    }
+
+    /// Takes a tab out of this window, still awake, to move it to another. A window left
+    /// with no tabs closes.
+    private func detach(_ tab: Tab) {
+        guard let i = tabs.firstIndex(where: { $0 === tab }) else { return }
         let wasActive = i == activeIndex
         tabs.remove(at: i)
         tab.webView?.removeFromSuperview()
+        if tabs.isEmpty { saveSessionNow(); window?.close(); return }
         if wasActive { activeIndex = min(i, tabs.count - 1) } else if i < activeIndex { activeIndex -= 1 }
         attachActiveTab()
         refreshChrome()
         scheduleSessionSave()
-        app.makeBrowserWindow(isPrivate: isPrivateWindow).adopt(tab)
     }
 
-    func adopt(_ tab: Tab) {
+    func adopt(_ tab: Tab, at requested: Int? = nil) {
         tab.delegate = self
         tab.opener = nil
-        let index = tab.isPinned ? pinnedCount : tabs.count
+        // Pinned tabs stay in the pinned section, others after it.
+        let wanted = requested ?? tabs.count
+        let index = tab.isPinned ? min(wanted, pinnedCount) : max(pinnedCount, min(wanted, tabs.count))
         tabs.insert(tab, at: index)
         activeIndex = index
         attachActiveTab()
@@ -748,6 +793,38 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         // ⌘Return opens the result in a new tab, as in Chrome.
         let newTab = NSApp.currentEvent?.modifierFlags.contains(.command) == true
         open(url, inNewTab: newTab)
+    }
+
+    // MARK: - Popovers
+
+    private var transientPopover: NSPopover?
+
+    /// One transient popover at a time; its content closes it when done.
+    private func present(_ controller: NSViewController, from rect: NSRect, in view: NSView) {
+        transientPopover?.close()
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.contentViewController = controller
+        popover.show(relativeTo: rect, of: view, preferredEdge: .maxY)
+        transientPopover = popover
+    }
+
+    /// ⌘⇧A: search every open tab in windows of this kind.
+    @objc func showTabSearch() {
+        if let p = transientPopover, p.isShown, p.contentViewController is TabSearchController { p.close(); return }
+        let kind = isPrivateWindow
+        let controller = TabSearchController { [weak self] in
+            (AppDelegate.shared?.allControllers ?? [self].compactMap { $0 }).filter { $0.isPrivateWindow == kind }
+        }
+        controller.onFinish = { [weak self] in self?.transientPopover?.close() }
+        present(controller, from: NSRect(x: max(0, tabStrip.bounds.maxX - 44), y: 0, width: 44, height: tabStrip.bounds.height), in: tabStrip)
+    }
+
+    func showPageInfo() {
+        guard let tab = activeTab, tab.url != nil else { return }
+        let controller = PageInfoController(tab: tab, browser: self)
+        controller.onFinish = { [weak self] in self?.transientPopover?.close() }
+        present(controller, from: urlBar.siteInfoAnchor, in: urlBar)
     }
 
     private func revertAddressBar() {
@@ -1007,7 +1084,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         if sleeping > 0 { text += " \u{00B7} \(sleeping) asleep" }
         statusPill.text = text
         let budgetNote = MemoryBudgetController.shared.isEnabled ? " \u{00B7} target \(Config.shared.memoryBudgetMB) MB" : ""
-        statusPill.toolTip = "\(s.display) total\(budgetNote) \u{2014} app \(ByteCountFormatter.string(fromByteCount: Int64(s.appBytes), countStyle: .memory)) + \(s.helperCount) web process\(s.helperCount == 1 ? "" : "es")"
+        statusPill.toolTip = "\(s.display) total\(budgetNote) \u{2014} app \(ByteCountFormatter.string(fromByteCount: Int64(s.appBytes), countStyle: .memory)) + \(s.helperCount) web process\(s.helperCount == 1 ? "" : "es"). Click for the Task Manager."
         layoutChrome()
     }
 
@@ -1182,6 +1259,10 @@ extension BrowserWindowController: TabStripDelegate {
     func tabStripDidSelect(index: Int) { selectTab(index: index) }
     func tabStripDidRequestClose(index: Int) { closeTab(index: index) }
     func tabStripDidRequestNewTab() { newTab() }
+    func tabStripDidDetach(index: Int, at screenPoint: NSPoint) {
+        guard tabs.indices.contains(index) else { return }
+        moveTab(tabs[index], toScreenPoint: screenPoint)
+    }
 
     func tabStripDidToggleMute(index: Int) {
         guard tabs.indices.contains(index) else { return }

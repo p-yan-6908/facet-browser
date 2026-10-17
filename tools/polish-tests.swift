@@ -78,10 +78,12 @@ struct PolishTests {
         historyRetention()
         assistant()
         try browserFeatures(root)
+        browserParity()
         if CommandLine.arguments.contains("--webkit") {
             try webKitPrivacy(); assistantSidebarUI(); try cookieStoreRoundTrip(); sessionImportConsentUI(root)
             try browserFeaturesWebKit(root)
             try blockingWebKit(root)
+            try browserParityWebKit()
         }
         else { print("SKIP: WebKit UI probes (run with --webkit in a macOS GUI session)") }
         print("\(checks - failures.count)/\(checks) checks passed")

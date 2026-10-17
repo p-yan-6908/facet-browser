@@ -114,6 +114,11 @@ class ToolbarButton: NSButton {
 /// a deliberate part of the toolbar rather than leftover debug text.
 final class StatusPill: NSView {
     var text: String = "" { didSet { needsDisplay = true } }
+    var onClick: (() -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        if let onClick { onClick() } else { super.mouseDown(with: event) }
+    }
 
     override var isFlipped: Bool { true }
 
@@ -198,6 +203,10 @@ final class URLBar: NSView {
     let field = URLField()
     private var focused = false
     private let glyph = NSImageView()
+    /// Clicking the lock opens site information, as in Chrome.
+    var onSiteInfo: (() -> Void)?
+    private var showsSiteInfo = false
+    var siteInfoAnchor: NSRect { glyph.frame }
 
     override var isFlipped: Bool { true }
 
@@ -237,11 +246,15 @@ final class URLBar: NSView {
 
     /// Reflects what is loaded: secure, plaintext, or nothing yet.
     func showSecurity(for url: URL?) {
-        switch url?.scheme?.lowercased() {
+        let scheme = url?.scheme?.lowercased()
+        switch scheme {
         case "https": setGlyph("lock.fill", .secondaryLabelColor)
         case "http":  setGlyph("exclamationmark.triangle.fill", .systemOrange)
+        case "file":  setGlyph("doc", .secondaryLabelColor)
         default:      setGlyph("magnifyingglass", .tertiaryLabelColor)
         }
+        showsSiteInfo = ["https", "http", "file"].contains(scheme ?? "")
+        glyph.toolTip = showsSiteInfo ? "View site information" : nil
     }
 
     override func layout() {
@@ -253,6 +266,8 @@ final class URLBar: NSView {
 
     /// Clicking anywhere in the capsule should start editing, not just the text itself.
     override func mouseDown(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        if showsSiteInfo, let onSiteInfo, glyph.frame.insetBy(dx: -6, dy: -6).contains(p) { onSiteInfo(); return }
         window?.makeFirstResponder(field)
     }
 

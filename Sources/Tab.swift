@@ -242,6 +242,26 @@ final class Tab: NSObject {
         return !isPlayingMedia
     }
 
+    /// The WebKit content process rendering this tab, or nil while it sleeps. WebKit only
+    /// exposes this as SPI, so it is guarded: without it the Task Manager shows totals only.
+    var webProcessID: pid_t? {
+        guard let wv = webView, wv.responds(to: NSSelectorFromString("_webProcessIdentifier")),
+              let pid = (wv.value(forKey: "_webProcessIdentifier") as? NSNumber)?.int32Value, pid > 0 else { return nil }
+        return pid
+    }
+
+    /// Chrome-style hover text: the title, then the site and what the tab costs right now.
+    var hoverDescription: String {
+        let site = url?.host ?? ""
+        var cost = ""
+        if isHibernated { cost = hasEverLoaded || url != nil ? "asleep, using no memory" : "" }
+        else if let pid = webProcessID {
+            cost = ByteCountFormatter.string(fromByteCount: Int64(MemoryMonitor.footprint(of: pid)), countStyle: .memory)
+        }
+        let detail = [site, cost].filter { !$0.isEmpty }.joined(separator: " \u{00B7} ")
+        return detail.isEmpty ? displayTitle : "\(displayTitle)\n\(detail)"
+    }
+
     func acquireAgentLease() { agentLeaseCount += 1 }
     /// The element a ref named in the last snapshot, for judging how risky acting on it is.
     func agentElement(ref: String) -> AgentElement? { lastAgentElements[ref] }

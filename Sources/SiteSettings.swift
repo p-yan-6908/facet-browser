@@ -64,6 +64,19 @@ final class SiteSettings {
         scheduleSave()
     }
 
+    /// Remembered decisions for one host, by kind ("camera", "open:zoommtg", ...).
+    func rememberedPermissions(for host: String) -> [(kind: String, allowed: Bool)] {
+        let prefix = host.lowercased() + "|"
+        return permissions.compactMap { key, allowed in key.hasPrefix(prefix) ? (String(key.dropFirst(prefix.count)), allowed) : nil }
+            .sorted { $0.kind < $1.kind }
+    }
+
+    /// Forgets one decision, so the site is asked again.
+    func clearPermission(_ kind: String, for host: String) {
+        permissions.removeValue(forKey: "\(host.lowercased())|\(kind)")
+        scheduleSave()
+    }
+
     func resetPermissions() {
         permissions.removeAll()
         scheduleSave()

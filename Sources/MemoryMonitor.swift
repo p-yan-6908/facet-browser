@@ -27,7 +27,7 @@ enum MemoryMonitor {
     /// actually expects the address of the struct itself -- callers in C cast `&rusage` to
     /// that type. Passing a pointer-to-pointer makes the kernel write the whole struct over
     /// an 8-byte slot.
-    private static func footprint(of pid: pid_t) -> UInt64 {
+    static func footprint(of pid: pid_t) -> UInt64 {
         let size = MemoryLayout<rusage_info_v4>.stride
         let raw = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: 8)
         defer { raw.deallocate() }

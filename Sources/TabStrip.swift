@@ -8,11 +8,13 @@ protocol TabStripDelegate: AnyObject {
     func tabStripContextActions(index: Int) -> [(String, () -> Void)]
     func tabStripDidRequestMove(from: Int, to: Int)
     func tabStripDidToggleMute(index: Int)
+    /// The tab was dragged off the strip and dropped at `screenPoint`.
+    func tabStripDidDetach(index: Int, at screenPoint: NSPoint)
 }
 
 /// One view per tab, everything drawn by hand. A stock NSTableView or NSSegmented
 /// control would add layers, cells and layout passes we do not need.
-final class TabItemView: NSView {
+final class TabItemView: NSView, NSViewToolTipOwner {
     var title: String = "" { didSet { if title != oldValue { needsDisplay = true } } }
     var favicon: NSImage? { didSet { if favicon !== oldValue { needsDisplay = true } } }
     var isSelected = false { didSet { if isSelected != oldValue { needsDisplay = true } } }
@@ -36,8 +38,21 @@ final class TabItemView: NSView {
     var onDragBegan: ((CGFloat) -> Void)?      // press x within this item
     var onDragChanged: ((NSPoint) -> Void)?    // pointer, window coordinates
     var onDragEnded: (() -> Void)?
+    /// Hover text, built when it shows so a live tab's memory figure is current.
+    var toolTipProvider: (() -> String)?
 
     private var trackingAreaRef: NSTrackingArea?
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        removeAllToolTips()
+        addToolTip(bounds, owner: self, userData: nil)
+    }
+
+    func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint,
+              userData data: UnsafeMutableRawPointer?) -> String {
+        toolTipProvider?() ?? title
+    }
 
     override var isFlipped: Bool { true }
 
@@ -82,7 +97,7 @@ final class TabItemView: NSView {
     override func mouseDragged(with event: NSEvent) {
         guard let press = pressPoint else { return }
         let here = convert(event.locationInWindow, from: nil)
-        if !dragging, abs(here.x - press.x) > 5 {
+        if !dragging, abs(here.x - press.x) > 5 || abs(here.y - press.y) > 8 {
             dragging = true
             onDragBegan?(press.x)
         }
@@ -239,6 +254,8 @@ final class TabStripView: NSView {
     private let newTabButton = NSButton()
 
     private var dragIndex: Int?
+    /// Set while a dragged tab is far enough off the strip to become its own window.
+    private var dragDetached = false
     private var dragGrabX: CGFloat = 0     // where in the tab the press landed
     private var dragPointerX: CGFloat = 0  // pointer, strip coordinates
 
@@ -293,10 +310,7 @@ final class TabStripView: NSView {
             v.isPinned = tab.isPinned
             v.isAudible = tab.isPlayingAudio
             v.isMuted = tab.isMuted
-            let tip = tab.isHibernated
-                ? "\(tab.displayTitle) \u{2014} sleeping (0 MB)"
-                : (tab.isPinned ? tab.displayTitle : tab.url?.absoluteString ?? tab.displayTitle)
-            if v.toolTip != tip { v.toolTip = tip }
+            v.toolTipProvider = { [weak tab] in tab?.hoverDescription ?? "" }
         }
         layoutTabs()
     }
@@ -355,9 +369,28 @@ final class TabStripView: NSView {
         addSubview(items[index])          // raise above its neighbours while moving
     }
 
+    /// How far above or below the strip a dragged tab may go before dropping it opens a window.
+    static let detachDistance: CGFloat = 36
+
+    static func isDetached(_ pointer: NSPoint, stripHeight: CGFloat) -> Bool {
+        pointer.y < -detachDistance || pointer.y > stripHeight + detachDistance
+    }
+
+    /// The slot a tab dropped at `x` (strip coordinates) would take.
+    func insertionIndex(atX x: CGFloat) -> Int {
+        slotFrames().firstIndex { x < $0.midX } ?? items.count
+    }
+
     private func updateDrag(_ pointerInWindow: NSPoint) {
         guard let from = dragIndex, items.indices.contains(from) else { return }
-        dragPointerX = convert(pointerInWindow, from: nil).x
+        let local = convert(pointerInWindow, from: nil)
+        dragPointerX = local.x
+        let detached = items.count > 1 && Self.isDetached(local, stripHeight: bounds.height)
+        if detached != dragDetached {
+            dragDetached = detached
+            items[from].alphaValue = detached ? 0.5 : 1
+        }
+        if detached { layoutTabs(); return }  // no reordering while torn off
         let frames = slotFrames()
         let center = dragPointerX - dragGrabX + frames[from].width / 2
         let range = section(of: from)
@@ -375,8 +408,14 @@ final class TabStripView: NSView {
     }
 
     private func endDrag() {
+        let detachedIndex = dragDetached ? dragIndex : nil
+        if let i = dragIndex, items.indices.contains(i) { items[i].alphaValue = 1 }
         dragIndex = nil
+        dragDetached = false
         layoutTabs()
+        // After the mouse-up returns: moving the tab rebuilds the item views handling it.
+        let point = NSEvent.mouseLocation
+        if let detachedIndex { DispatchQueue.main.async { [weak self] in self?.delegate?.tabStripDidDetach(index: detachedIndex, at: point) } }
     }
 
     override func layout() {
