@@ -87,8 +87,13 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Generate a simple app icon from an SF Symbol-ish drawing.
-if [ -x /usr/bin/python3 ]; then python3 tools/make_icon.py "$APP/Contents/Resources/AppIcon.icns" || true; fi
+# Build the app icon from the checked-in facet.png artwork, reusing the last one when
+# neither the artwork nor the tool has changed.
+if [ ! build/AppIcon.icns -nt facet.png ] || [ ! build/AppIcon.icns -nt tools/make_icon.swift ]; then
+  swiftc -O -swift-version 5 -o build/make_icon tools/make_icon.swift
+  build/make_icon facet.png build/AppIcon.icns
+fi
+cp build/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 if [ "$SIGN_IDENTITY" = "-" ]; then
   codesign --force --sign - "$APP"

@@ -62,6 +62,7 @@ final class MemoryBudgetController {
         timer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
             self?.enforceBudget(reason: "periodic")
         }
+        timer?.tolerance = 1
         installMemoryPressureHandling()
     }
 
@@ -105,7 +106,10 @@ final class MemoryBudgetController {
     func enforceBudget(reason: String) {
         guard isEnabled else { return }
         guard !isReclaiming else { pendingEnforcement = true; return }
-        let before = sample(maxAge: 0)
+        // Listing every process costs CPU. Far under the budget, the periodic check reuses a
+        // recent sample (the status pill takes one every few seconds) rather than its own.
+        let farUnder = reason == "periodic" && (lastSample.map { $0.totalBytes < softLimit / 2 } ?? false)
+        let before = sample(maxAge: farUnder ? 20 : 0)
         guard before.totalBytes > softLimit else { return }
         let candidates = evictionCandidates(excluding: nil)
         guard !candidates.isEmpty else { return }
@@ -158,7 +162,9 @@ final class MemoryBudgetController {
         var result: [Tab] = []
         for window in windows.allObjects {
             for tab in window.tabs {
-                if tab === excluding || tab === window.activeTab { continue }
+                if tab === excluding { continue }
+                // The page on screen is never evicted; one in a hidden window can be.
+                if tab === window.activeTab && window.isContentVisible { continue }
                 if tab.canHibernateForBudget { result.append(tab) }
             }
         }

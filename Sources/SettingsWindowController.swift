@@ -17,7 +17,7 @@ final class SettingsWindowController: NSWindowController {
         tabs.tabStyle = .toolbar
         tabs.addChild(GeneralSettingsViewController())
         tabs.addChild(MemorySettingsViewController())
-        tabs.addChild(AgentSettingsViewController())
+        if Config.agentFeatureAvailable { tabs.addChild(AgentSettingsViewController()) }
         tabs.addChild(ImportSettingsViewController(sourceProvider: importSourceProvider))
         tabs.addChild(PrivacySettingsViewController())
         w.contentViewController = tabs
@@ -32,7 +32,7 @@ final class SettingsWindowController: NSWindowController {
     }
 
     func selectImportPane() {
-        tabs.selectedTabViewItemIndex = 3
+        if let i = tabs.children.firstIndex(where: { $0 is ImportSettingsViewController }) { tabs.selectedTabViewItemIndex = i }
     }
 }
 

@@ -4,12 +4,23 @@ import AppKit
 /// process at all -- there is literally nothing to load.
 final class StartView: NSView {
     var onOpen: ((String) -> Void)?
+    var onFocusAddressBar: (() -> Void)?
+
+    private let titleLabel = NSTextField(labelWithString: "Facet")
+    private let searchButton = SearchPromptButton()
+    private var tiles: [SiteTileView] = []
 
     override var isFlipped: Bool { true }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
+        titleLabel.font = .systemFont(ofSize: 30, weight: .semibold)
+        titleLabel.textColor = .labelColor
+        titleLabel.alignment = .center
+        addSubview(titleLabel)
+        searchButton.onClick = { [weak self] in self?.onFocusAddressBar?() }
+        addSubview(searchButton)
         rebuild()
     }
 
@@ -23,19 +34,8 @@ final class StartView: NSView {
     }
 
     func rebuild() {
-        subviews.forEach { $0.removeFromSuperview() }
-
-        let title = NSTextField(labelWithString: "Facet")
-        title.font = .systemFont(ofSize: 30, weight: .semibold)
-        title.textColor = .labelColor
-        title.alignment = .center
-        addSubview(title)
-
-        let sub = NSTextField(labelWithString: "\u{2318}L to go somewhere")
-        sub.font = .systemFont(ofSize: 12)
-        sub.textColor = .tertiaryLabelColor
-        sub.alignment = .center
-        addSubview(sub)
+        searchButton.text = "Search \(Config.shared.searchEngineName) or type a URL"
+        tiles.forEach { $0.removeFromSuperview() }
 
         // Top sites by visit count, one entry per host.
         var seenHosts = Set<String>()
@@ -49,52 +49,134 @@ final class StartView: NSView {
             if top.count == 10 { break }
         }
 
-        for site in top {
-            let b = NSButton(title: site.host, target: self, action: #selector(openSite(_:)))
-            b.bezelStyle = .accessoryBarAction
-            b.isBordered = false
-            b.font = .systemFont(ofSize: 12, weight: .medium)
-            b.contentTintColor = .secondaryLabelColor
-            b.identifier = NSUserInterfaceItemIdentifier(site.url)
-            b.wantsLayer = true
-            b.layer?.backgroundColor = NSColor.quaternaryLabelColor.withAlphaComponent(0.12).cgColor
-            b.layer?.cornerRadius = 8
-            addSubview(b)
+        tiles = top.map { site in
+            let tile = SiteTileView(host: site.host, icon: FaviconStore.shared.icon(forHost: URL(string: site.url)?.host))
+            tile.onClick = { [weak self] in self?.onOpen?(site.url) }
+            addSubview(tile)
+            return tile
         }
         needsLayout = true
     }
 
-    @objc private func openSite(_ sender: NSButton) {
-        if let id = sender.identifier?.rawValue { onOpen?(id) }
-    }
-
     override func layout() {
         super.layout()
-        let labels = subviews.compactMap { $0 as? NSTextField }
-        let buttons = subviews.compactMap { $0 as? NSButton }
+        let centerY = bounds.height * 0.26
+        titleLabel.frame = NSRect(x: 0, y: centerY, width: bounds.width, height: 38)
+        let searchW = min(560, bounds.width - 80)
+        searchButton.frame = NSRect(x: (bounds.width - searchW) / 2, y: centerY + 56, width: searchW, height: 40)
 
-        let centerY = bounds.height * 0.34
-        if labels.count >= 2 {
-            labels[0].frame = NSRect(x: 0, y: centerY, width: bounds.width, height: 38)
-            labels[1].frame = NSRect(x: 0, y: centerY + 40, width: bounds.width, height: 18)
-        }
-
-        guard !buttons.isEmpty else { return }
-        // Center a wrapping row of pills under the title.
-        let perRow = max(1, min(5, Int(bounds.width / 150)))
-        let bw: CGFloat = 132, bh: CGFloat = 30, gap: CGFloat = 10
+        guard !tiles.isEmpty else { return }
+        // Centre a wrapping grid of tiles under the search prompt.
+        let tw: CGFloat = 104, th: CGFloat = 92, gap: CGFloat = 14
+        let perRow = max(1, min(5, Int((bounds.width - 40) / (tw + gap))))
         var i = 0
-        while i < buttons.count {
-            let rowCount = min(perRow, buttons.count - i)
-            let rowWidth = CGFloat(rowCount) * bw + CGFloat(rowCount - 1) * gap
+        while i < tiles.count {
+            let rowCount = min(perRow, tiles.count - i)
+            let rowWidth = CGFloat(rowCount) * tw + CGFloat(rowCount - 1) * gap
             var x = (bounds.width - rowWidth) / 2
-            let y = centerY + 84 + CGFloat(i / perRow) * (bh + gap)
+            let y = centerY + 128 + CGFloat(i / perRow) * (th + gap)
             for j in 0..<rowCount {
-                buttons[i + j].frame = NSRect(x: x, y: y, width: bw, height: bh)
-                x += bw + gap
+                tiles[i + j].frame = NSRect(x: x, y: y, width: tw, height: th)
+                x += tw + gap
             }
             i += rowCount
         }
+    }
+}
+
+/// The big "Search or type a URL" capsule. Clicking it focuses the real address bar,
+/// as Chrome's new-tab search box does.
+final class SearchPromptButton: NSView {
+    var text = "" { didSet { needsDisplay = true } }
+    var onClick: (() -> Void)?
+    private var hovering = false { didSet { needsDisplay = true } }
+
+    override var isFlipped: Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInKeyWindow], owner: self))
+    }
+    override func mouseEntered(with event: NSEvent) { hovering = true }
+    override func mouseExited(with event: NSEvent) { hovering = false }
+    override func mouseUp(with event: NSEvent) { onClick?() }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .iBeam) }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let r = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let path = NSBezierPath(roundedRect: r, xRadius: r.height / 2, yRadius: r.height / 2)
+        NSColor.quaternaryLabelColor.withAlphaComponent(hovering ? 0.22 : 0.14).setFill()
+        path.fill()
+        NSColor.separatorColor.setStroke()
+        path.lineWidth = 1
+        path.stroke()
+        let cfg = NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [.secondaryLabelColor]))
+        if let glass = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil)?.withSymbolConfiguration(cfg) {
+            let s = glass.size
+            glass.draw(in: NSRect(x: 18, y: bounds.midY - s.height / 2, width: s.width, height: s.height),
+                       from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+        }
+        let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 15), .foregroundColor: NSColor.tertiaryLabelColor]
+        let s = NSAttributedString(string: text, attributes: attrs)
+        s.draw(at: NSPoint(x: 46, y: bounds.midY - s.size().height / 2))
+    }
+}
+
+/// A most-visited site: its favicon (or initial) over its name.
+final class SiteTileView: NSView {
+    let host: String
+    let icon: NSImage?
+    var onClick: (() -> Void)?
+    private var hovering = false { didSet { needsDisplay = true } }
+
+    override var isFlipped: Bool { true }
+
+    init(host: String, icon: NSImage?) {
+        self.host = host
+        self.icon = icon
+        super.init(frame: .zero)
+        toolTip = host
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInKeyWindow], owner: self))
+    }
+    override func mouseEntered(with event: NSEvent) { hovering = true }
+    override func mouseExited(with event: NSEvent) { hovering = false }
+    override func mouseUp(with event: NSEvent) {
+        if bounds.contains(convert(event.locationInWindow, from: nil)) { onClick?() }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        if hovering {
+            NSColor.quaternaryLabelColor.withAlphaComponent(0.16).setFill()
+            NSBezierPath(roundedRect: bounds, xRadius: 12, yRadius: 12).fill()
+        }
+        let circle = NSRect(x: bounds.midX - 24, y: 12, width: 48, height: 48)
+        NSColor.quaternaryLabelColor.withAlphaComponent(0.22).setFill()
+        NSBezierPath(ovalIn: circle).fill()
+        if let icon {
+            icon.draw(in: circle.insetBy(dx: 14, dy: 14), from: .zero, operation: .sourceOver, fraction: 1,
+                      respectFlipped: true, hints: nil)
+        } else {
+            let letter = NSAttributedString(string: String(host.first.map(String.init)?.uppercased() ?? "\u{2022}"), attributes: [
+                .font: NSFont.systemFont(ofSize: 18, weight: .semibold), .foregroundColor: NSColor.secondaryLabelColor])
+            let s = letter.size()
+            letter.draw(at: NSPoint(x: circle.midX - s.width / 2, y: circle.midY - s.height / 2))
+        }
+        let ps = NSMutableParagraphStyle()
+        ps.alignment = .center
+        ps.lineBreakMode = .byTruncatingTail
+        let label = NSAttributedString(string: host, attributes: [
+            .font: NSFont.systemFont(ofSize: 11.5), .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: ps])
+        label.draw(with: NSRect(x: 6, y: 66, width: bounds.width - 12, height: 16),
+                   options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
     }
 }
 

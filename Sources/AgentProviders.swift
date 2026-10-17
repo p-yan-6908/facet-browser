@@ -24,7 +24,7 @@ enum AgentProviderKind: String, CaseIterable {
     }
 
     var defaultModel: String {
-        usesAnthropicProtocol ? "claude-sonnet-5" : "gpt-5.6-luna"
+        usesAnthropicProtocol ? "claude-sonnet-5-5" : "gpt-5.6-luna"
     }
 
     static var configured: AgentProviderKind {
@@ -94,7 +94,7 @@ extension BrowserAgentService {
         let body: [String: Any] = [
             "model": Config.shared.agentModel,
             "system": Self.systemPrompt,
-            "messages": messages,
+            "messages": Self.withCacheBreakpoint(messages),
             "tools": anthropicTools,
             "max_tokens": 2500
         ]
@@ -142,6 +142,23 @@ extension BrowserAgentService {
                 }
             }
         }
+    }
+
+    /// Marks the end of the conversation as a prompt-cache breakpoint. Each tool step resends
+    /// everything before it (tools, system prompt, earlier page snapshots), so caching that
+    /// prefix makes later steps cheaper and faster. Only the outgoing copy is marked, which
+    /// keeps the conversation under Anthropic's limit of four breakpoints.
+    static func withCacheBreakpoint(_ messages: [[String: Any]]) -> [[String: Any]] {
+        guard var last = messages.last else { return messages }
+        var blocks: [[String: Any]]
+        if let text = last["content"] as? String { blocks = [["type": "text", "text": text]] }
+        else if let array = last["content"] as? [[String: Any]], !array.isEmpty { blocks = array }
+        else { return messages }
+        blocks[blocks.count - 1]["cache_control"] = ["type": "ephemeral"]
+        last["content"] = blocks
+        var out = messages
+        out[out.count - 1] = last
+        return out
     }
 
     private func executeAnthropicCalls(_ calls: [[String: Any]], index: Int,

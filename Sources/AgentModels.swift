@@ -31,6 +31,8 @@ struct AgentElement: Codable {
     let value: String?
     let href: String?
     let disabled: Bool
+    /// Choices for <select> elements, so the model can fill them by visible text.
+    let options: [String]?
 }
 
 struct AgentPageSnapshot: Codable {

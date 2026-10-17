@@ -5,13 +5,15 @@ import AppKit
 /// The stock borderless NSButton draws its symbol at the default thin weight in
 /// secondary grey, which reads as disabled. A semibold glyph in `labelColor` plus a
 /// hover background is the difference between "faint decoration" and "a button".
-final class ToolbarButton: NSButton {
+class ToolbarButton: NSButton {
     private var hovering = false
     private var trackingAreaRef: NSTrackingArea?
     private var symbolName: String
 
     /// Set for toggles that should read as "on" (the shield, a filled bookmark star).
     var isHighlighted2 = false { didSet { refresh() } }
+    /// Menu shown on press-and-hold or right-click, like the history lists on Back/Forward.
+    var menuProvider: (() -> NSMenu?)?
     var onTint: NSColor = .controlAccentColor
     var normalTint: NSColor = .labelColor
     var disabledTint: NSColor = .tertiaryLabelColor
@@ -58,6 +60,35 @@ final class ToolbarButton: NSButton {
 
     override func mouseEntered(with event: NSEvent) { hovering = true; refresh() }
     override func mouseExited(with event: NSEvent) { hovering = false; refresh() }
+
+    /// A click acts immediately; holding for 0.4 s (or dragging down) opens the menu instead.
+    override func mouseDown(with event: NSEvent) {
+        guard menuProvider != nil, isEnabled, let window else { super.mouseDown(with: event); return }
+        highlight(true)
+        let deadline = Date().addingTimeInterval(0.4)
+        let start = event.locationInWindow
+        while true {
+            guard let next = window.nextEvent(matching: [.leftMouseUp, .leftMouseDragged], until: deadline,
+                                              inMode: .eventTracking, dequeue: true) else {
+                highlight(false); showMenu(); return
+            }
+            if next.type == .leftMouseUp {
+                highlight(false)
+                if bounds.contains(convert(next.locationInWindow, from: nil)) { sendAction(action, to: target) }
+                return
+            }
+            if abs(next.locationInWindow.y - start.y) > 6 { highlight(false); showMenu(); return }
+        }
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        if menuProvider != nil { showMenu() } else { super.rightMouseDown(with: event) }
+    }
+
+    private func showMenu() {
+        guard let menu = menuProvider?(), !menu.items.isEmpty else { return }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: isFlipped ? bounds.maxY + 4 : -4), in: self)
+    }
 
     /// Layer colours are resolved CGColors, so they have to be rebuilt when the user
     /// switches between light and dark.
@@ -106,6 +137,38 @@ final class StatusPill: NSView {
         NSColor.quaternaryLabelColor.withAlphaComponent(0.22).setFill()
         NSBezierPath(roundedRect: pill, xRadius: h / 2, yRadius: h / 2).fill()
         s.draw(at: NSPoint(x: pill.minX + 9, y: pill.midY - size.height / 2))
+    }
+}
+
+/// Chrome's status bubble: the address of the hovered link, bottom-left over the page.
+final class LinkStatusView: NSView {
+    var text: String = "" { didSet { if text != oldValue { isHidden = text.isEmpty; needsDisplay = true } } }
+
+    override var isFlipped: Bool { true }
+
+    private var attributes: [NSAttributedString.Key: Any] {
+        let ps = NSMutableParagraphStyle()
+        ps.lineBreakMode = .byTruncatingMiddle
+        return [.font: NSFont.systemFont(ofSize: 11.5), .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: ps]
+    }
+
+    func fittingWidth(max limit: CGFloat) -> CGFloat {
+        min(limit, ceil(NSAttributedString(string: text, attributes: attributes).size().width) + 16)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard !text.isEmpty else { return }
+        let r = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let path = NSBezierPath(roundedRect: r, xRadius: 5, yRadius: 5)
+        NSColor.windowBackgroundColor.withAlphaComponent(0.97).setFill()
+        path.fill()
+        NSColor.separatorColor.setStroke()
+        path.lineWidth = 1
+        path.stroke()
+        let s = NSAttributedString(string: text, attributes: attributes)
+        let h = s.size().height
+        s.draw(with: NSRect(x: 8, y: (bounds.height - h) / 2, width: bounds.width - 16, height: h),
+               options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
     }
 }
 

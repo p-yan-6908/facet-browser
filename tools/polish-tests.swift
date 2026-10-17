@@ -68,13 +68,21 @@ struct PolishTests {
         Config.shared.memoryBudgetMB = 0
         Config.shared.enableDeveloperTools = false
         Config.shared.blockAdsAndTrackers = false
+        // The agent is parked in the app, but its code stays under test.
+        Config.agentFeatureAvailable = true
         URLProtocol.registerClass(FixtureProtocol.self)
         try imports(root)
         try navigation()
         try chromeSessions(root)
         sessionAndMemory(root)
+        historyRetention()
         assistant()
-        if CommandLine.arguments.contains("--webkit") { try webKitPrivacy(); assistantSidebarUI(); try cookieStoreRoundTrip(); sessionImportConsentUI(root) }
+        try browserFeatures(root)
+        if CommandLine.arguments.contains("--webkit") {
+            try webKitPrivacy(); assistantSidebarUI(); try cookieStoreRoundTrip(); sessionImportConsentUI(root)
+            try browserFeaturesWebKit(root)
+            try blockingWebKit(root)
+        }
         else { print("SKIP: WebKit UI probes (run with --webkit in a macOS GUI session)") }
         print("\(checks - failures.count)/\(checks) checks passed")
         if !failures.isEmpty { exit(1) }
@@ -192,6 +200,30 @@ struct PolishTests {
         expect(!BrowserAgentService.requiresApproval("visual_inspect"), "visual inspection remains read-only")
     }
 
+    static func historyRetention() {
+        // A full history of repeat visits (as after an import) must still record today's sites.
+        let monthAgo = Date().addingTimeInterval(-30 * 86_400)
+        Store.shared.importHistory((0..<4000).map {
+            HistoryEntry(url: "https://retention\($0).test/", title: "", visits: 2, lastVisit: monthAgo)
+        })
+        Store.shared.flush()
+        Store.shared.recordVisit(url: URL(string: "https://today.test/new")!, title: "New")
+        Store.shared.flush()
+        expect(Store.shared.history.contains { $0.url == "https://today.test/new" }, "new visit survives a full history")
+        expect(Store.shared.history.count == 4000, "history stays capped")
+        Store.shared.importHistory([HistoryEntry(url: "https://favourite.test/", title: "", visits: 400, lastVisit: monthAgo)])
+        Store.shared.flush()
+        expect(Store.shared.history.contains { $0.url == "https://favourite.test/" }, "frequently visited older site is kept")
+        Store.shared.clearHistory()
+
+        // Quitting with every normal window closed keeps the session the last window saved.
+        Store.shared.saveSession(windows: [SavedWindow(tabs: [SavedTab(url: "https://kept.test/", title: "", interactionState: nil)],
+                                                       activeIndex: 0, frame: nil)], selectedWindow: 0)
+        AppDelegate().saveApplicationSession()
+        expect(Store.shared.loadSessionWindows().windows.first?.tabs.first?.url == "https://kept.test/",
+               "quitting with no windows keeps the last session")
+    }
+
     static func assistant() {
         let service = BrowserAgentService.shared
         service.apiKeyOverride = "synthetic-key"
@@ -261,6 +293,21 @@ struct PolishTests {
         service.executeTool(name: "close_tab", args: [:], session: resetSession) { _ in }
         expect(resetApprovals == 1, "YOLO never persists into the next task")
         resetSession.finish()
+
+        // "Allow Safe Actions This Task" covers approved sites only, and never non-link clicks.
+        FixtureProtocol.reset("text")
+        var scopeReset = false
+        service.run(prompt: "reset approval scope", status: { _ in }) { _ in scopeReset = true }
+        wait("approval scope resets", until: { scopeReset })
+        let scoped = BrowserAgentSession()
+        var asked: [String] = []
+        service.requestApproval = { request, reply in asked.append(request.tool); reply(.allowSafeForTask) }
+        for url in ["https://first.test/", "https://first.test/next", "https://other.test/?q=page-data"] {
+            service.executeTool(name: "navigate", args: ["tab_id": "missing", "url": url], session: scoped) { _ in }
+        }
+        service.executeTool(name: "click", args: ["tab_id": "missing", "ref": "e1"], session: scoped) { _ in }
+        expect(asked == ["navigate", "navigate", "click"], "safe-for-task approval does not reach new sites or non-link clicks")
+        scoped.finish()
 
         service.requestApproval = nil
         let session = BrowserAgentSession()

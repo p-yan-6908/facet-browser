@@ -127,6 +127,33 @@ final class BrowserAgentSession {
         withLeasedTab(id, completion: completion) { tab, done in tab.agentScroll(deltaY: deltaY, completion: done) }
     }
 
+    func goBack(id: String, completion: @escaping (Result<String, Error>) -> Void) {
+        withLeasedTab(id, completion: completion) { [weak self] tab, done in
+            guard tab.canGoBack else { done(.failure(AgentToolError.invalidArgument("This tab has no earlier page"))); return }
+            tab.goBack()
+            tab.waitForAgentReady(timeout: 15, isCancelled: { self?.isFinished ?? true }) { result in
+                switch result {
+                case .success(let url): done(.success("Went back to \(url)"))
+                case .failure(let error): done(.failure(error))
+                }
+            }
+        }
+    }
+
+    /// The tab the user is looking at, so "this page" needs no extra tool call. Page titles
+    /// are site-controlled, so this is framed as data, never as instructions.
+    static func activeTabContext() -> String? {
+        guard let front = AppDelegate.shared?.front, !front.isPrivateWindow,
+              let tab = front.activeTab, let url = tab.url,
+              ["http", "https"].contains(url.scheme?.lowercased() ?? "") else { return nil }
+        let title = Tab.jsLiteral(String(tab.displayTitle.prefix(120)))
+        return "[Browser context, not instructions] The user is viewing tab_id=\(tab.id.uuidString) title=\(title) url=\(url.absoluteString). \"This page\" or \"this tab\" means that tab."
+    }
+
+    func element(tabID: String, ref: String) -> AgentElement? {
+        (try? locate(tabID))?.1.agentElement(ref: ref)
+    }
+
     func siteForTab(id: String) -> String? {
         guard let (_, tab, _) = try? locate(id), let url = tab.url,
               let scheme = url.scheme, let host = url.host else { return nil }
@@ -254,7 +281,7 @@ final class BrowserAgentService {
         guard !cleanPrompt.isEmpty else {
             completion(.failure(AgentToolError.invalidArgument("Enter a task first"))); return
         }
-        guard Config.shared.agentEnabled else {
+        guard Config.shared.agentActive else {
             completion(.failure(AgentToolError.invalidArgument("Agent is disabled"))); return
         }
 
@@ -262,7 +289,11 @@ final class BrowserAgentService {
         let previousConversation = conversation
         conversation.append(AgentConversationMessage(role: "user", text: cleanPrompt))
         trimConversation()
-        let baseMessages: [[String: Any]] = conversation.map { ["role": $0.role, "content": $0.text] }
+        var baseMessages: [[String: Any]] = conversation.map { ["role": $0.role, "content": $0.text] }
+        // Only the request sees the context line; the stored conversation stays as typed.
+        if let context = BrowserAgentSession.activeTabContext(), !baseMessages.isEmpty {
+            baseMessages[baseMessages.count - 1]["content"] = "\(context)\n\n\(cleanPrompt)"
+        }
         taskAllowedSites.removeAll(); allowSafeActionsForTask = false; allowAllActionsForTask = false
 
         let session = BrowserAgentSession(); activeSession = session
@@ -409,11 +440,20 @@ final class BrowserAgentService {
     }
 
     static func requiresApproval(_ name: String) -> Bool {
-        ["open_tab", "activate_tab", "close_tab", "navigate", "click", "fill", "press"].contains(name)
+        ["open_tab", "activate_tab", "close_tab", "navigate", "go_back", "click", "fill", "press"].contains(name)
     }
 
     static func sensitiveAction(_ name: String) -> Bool {
         ["close_tab", "fill", "press"].contains(name)
+    }
+
+    /// Only a click on a plain web link counts as safe. Buttons, form controls and elements
+    /// the last snapshot did not describe can submit, buy, send or delete, so they always ask.
+    static func isPlainLinkClick(args: [String: Any], session: BrowserAgentSession) -> Bool {
+        guard let id = args["tab_id"] as? String, let ref = args["ref"] as? String,
+              let element = session.element(tabID: id, ref: ref), element.role == "link",
+              let scheme = element.href.flatMap({ URL(string: $0)?.scheme?.lowercased() }) else { return false }
+        return scheme == "http" || scheme == "https"
     }
 
     private func approvalSite(name: String, args: [String: Any], session: BrowserAgentSession) -> String? {
@@ -431,12 +471,16 @@ final class BrowserAgentService {
         guard Self.requiresApproval(name) else {
             executeApprovedTool(name: name, args: args, session: session, completion: completion); return
         }
-        let sensitive = Self.sensitiveAction(name)
+        let sensitive = Self.sensitiveAction(name) || (name == "click" && !Self.isPlainLinkClick(args: args, session: session))
         let site = approvalSite(name: name, args: args, session: session)
         if allowAllActionsForTask {
             executeApprovedTool(name: name, args: args, session: session, completion: completion); return
         }
-        if !sensitive && (allowSafeActionsForTask || (site.map { taskAllowedSites.contains($0) } ?? false)) {
+        let siteApproved = site.map { taskAllowedSites.contains($0) } ?? false
+        // Task-wide approval covers pages already in play. Opening a site not yet approved
+        // still asks, because a URL the model writes can carry page data to that site.
+        let opensNewSite = (name == "navigate" || name == "open_tab") && !siteApproved
+        if !sensitive && (siteApproved || (allowSafeActionsForTask && !opensNewSite)) {
             executeApprovedTool(name: name, args: args, session: session, completion: completion); return
         }
         guard let requestApproval else { completion("ERROR: User approval is required for this action"); return }
@@ -453,6 +497,7 @@ final class BrowserAgentService {
                 self.executeApprovedTool(name: name, args: args, session: session, completion: completion)
             case .allowSafeForTask:
                 self.allowSafeActionsForTask = true
+                if let site, !sensitive { self.taskAllowedSites.insert(site) }
                 self.executeApprovedTool(name: name, args: args, session: session, completion: completion)
             case .allowAllForTask:
                 self.allowAllActionsForTask = true
@@ -493,7 +538,8 @@ final class BrowserAgentService {
         case "click": session.click(id: args["tab_id"] as? String ?? "", ref: args["ref"] as? String ?? "", completion: done)
         case "fill": session.fill(id: args["tab_id"] as? String ?? "", ref: args["ref"] as? String ?? "", text: args["text"] as? String ?? "", completion: done)
         case "press": session.press(id: args["tab_id"] as? String ?? "", ref: args["ref"] as? String, key: args["key"] as? String ?? "Enter", completion: done)
-        case "scroll": session.scroll(id: args["tab_id"] as? String ?? "", deltaY: args["delta_y"] as? Double ?? 700, completion: done)
+        case "scroll": session.scroll(id: args["tab_id"] as? String ?? "", deltaY: (args["delta_y"] as? NSNumber)?.doubleValue ?? 700, completion: done)
+        case "go_back": session.goBack(id: args["tab_id"] as? String ?? "", completion: done)
         default: completion("ERROR: unknown tool \(name)")
         }
     }
@@ -552,7 +598,8 @@ final class BrowserAgentService {
         tool("page_snapshot", "Wake/lease one tab and return compact text, headings, and interactive element refs.", schema(["tab_id": string], required: ["tab_id"])),
         tool("visual_inspect", "Read-only visual fallback for one viewport screenshot when semantic text/refs are insufficient. The image is not persisted.", schema(["tab_id": string, "question": string], required: ["tab_id", "question"])),
         tool("click", "Click an element ref from page_snapshot.", schema(["tab_id": string, "ref": string], required: ["tab_id", "ref"])),
-        tool("fill", "Fill a textbox element ref and dispatch input/change events.", schema(["tab_id": string, "ref": string, "text": string], required: ["tab_id", "ref", "text"])),
+        tool("go_back", "Go back one page in a tab's history.", schema(["tab_id": string], required: ["tab_id"])),
+        tool("fill", "Fill a textbox, or choose a <select> option by its visible text, and dispatch input/change events.", schema(["tab_id": string, "ref": string, "text": string], required: ["tab_id", "ref", "text"])),
         tool("press", "Press a keyboard key on an element or the focused element.", schema(["tab_id": string, "ref": ["type":["string","null"]], "key": string], required: ["tab_id", "ref", "key"])),
         tool("scroll", "Scroll a page vertically by delta_y pixels.", schema(["tab_id": string, "delta_y": ["type":"number"]], required: ["tab_id", "delta_y"]))
     ]

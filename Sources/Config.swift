@@ -16,6 +16,7 @@ final class Config {
     var restoreSessionOnLaunch: Bool = true
     var showMemoryReadout: Bool = true
     var enableDeveloperTools: Bool = true
+    var showBookmarksBar: Bool = false
 
     /// App-global target. 0 disables budget enforcement.
     var memoryBudgetMB: Int = 1536
@@ -23,6 +24,12 @@ final class Config {
     /// Agent provider preferences. API keys are never written here; direct providers read
     /// their environment variable or an in-memory key entered in the Agent window.
     var agentEnabled: Bool = true
+    /// The agent is parked while work focuses on the browser itself. While false, its menu
+    /// item, toolbar button, sidebar, context-menu entries and Settings pane are hidden
+    /// whatever `agentEnabled` says. The regression suite turns it on to keep the code tested.
+    static var agentFeatureAvailable = false
+    /// True when the agent may be shown and run.
+    var agentActive: Bool { Config.agentFeatureAvailable && agentEnabled }
     /// openai | anthropic | openai_oauth | anthropic_oauth
     var agentProvider: String = "openai"
     /// Base URL or full inference endpoint. Provider adapters append /responses or /messages when needed.
@@ -42,9 +49,12 @@ final class Config {
     var agentAnthropicOAuthClientID: String = ""
     var agentAnthropicOAuthScopes: String = ""
 
+    /// FACET_PROFILE_DIR points Facet at a throwaway profile, for testing and benchmarks.
     static var supportDir: URL = {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Facet", isDirectory: true)
+        let override = ProcessInfo.processInfo.environment["FACET_PROFILE_DIR"].flatMap { $0.isEmpty ? nil : $0 }
+        let base = override.map { URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("Facet", isDirectory: true)
         try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         return base
     }()
@@ -67,6 +77,7 @@ final class Config {
         if let v = d["restoreSessionOnLaunch"] as? Bool { restoreSessionOnLaunch = v }
         if let v = d["showMemoryReadout"] as? Bool { showMemoryReadout = v }
         if let v = d["enableDeveloperTools"] as? Bool { enableDeveloperTools = v }
+        if let v = d["showBookmarksBar"] as? Bool { showBookmarksBar = v }
         if let v = d["memoryBudgetMB"] as? Int { memoryBudgetMB = max(0, v) }
         if let v = d["agentEnabled"] as? Bool { agentEnabled = v }
         if let v = d["agentProvider"] as? String { agentProvider = v }
@@ -93,6 +104,7 @@ final class Config {
             "restoreSessionOnLaunch": restoreSessionOnLaunch,
             "showMemoryReadout": showMemoryReadout,
             "enableDeveloperTools": enableDeveloperTools,
+            "showBookmarksBar": showBookmarksBar,
             "memoryBudgetMB": memoryBudgetMB,
             "agentEnabled": agentEnabled,
             "agentProvider": agentProvider,
@@ -139,7 +151,31 @@ final class Config {
             }
         }
 
+        return searchURL(for: s)
+    }
+
+    /// The search-engine URL for a query, whatever the query looks like.
+    func searchURL(for query: String) -> URL? {
+        let s = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty else { return nil }
         let q = s.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(.init(charactersIn: "-._~"))) ?? s
         return URL(string: searchTemplate.replacingOccurrences(of: "%s", with: q))
+    }
+
+    /// True when `resolve(input:)` would search rather than open an address.
+    func isSearchQuery(_ input: String) -> Bool {
+        guard let resolved = resolve(input: input) else { return false }
+        return resolved == searchURL(for: input)
+    }
+
+    /// "Google", "DuckDuckGo", ... for menu titles and the omnibox.
+    var searchEngineName: String {
+        let host = URLComponents(string: searchTemplate.replacingOccurrences(of: "%s", with: "q"))?.host?.lowercased() ?? ""
+        let known = ["google": "Google", "duckduckgo": "DuckDuckGo", "bing": "Bing", "kagi": "Kagi",
+                     "ecosia": "Ecosia", "brave": "Brave Search", "yahoo": "Yahoo", "startpage": "Startpage",
+                     "perplexity": "Perplexity"]
+        for (needle, name) in known where host.contains(needle) { return name }
+        let parts = host.split(separator: ".")
+        return parts.count >= 2 ? String(parts[parts.count - 2]).capitalized : (host.isEmpty ? "the web" : host)
     }
 }

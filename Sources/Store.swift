@@ -13,6 +13,12 @@ struct SavedTab {
     var title: String
     /// WKWebView.interactionState blob: full back/forward list + scroll position.
     var interactionState: Data?
+    var pinned: Bool = false
+}
+
+extension Notification.Name {
+    /// Posted whenever the bookmark list changes, so every bookmarks bar can redraw.
+    static let facetBookmarksChanged = Notification.Name("FacetBookmarksChanged")
 }
 
 struct SavedWindow {
@@ -45,6 +51,7 @@ final class Store {
         saveTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
             self?.flush()
         }
+        saveTimer?.tolerance = 5  // let macOS batch this wake-up with others
     }
 
     private func reindex() {
@@ -85,6 +92,22 @@ final class Store {
         flush()
     }
 
+    /// Removes visits made since `date`, for the Clear Browsing Data time ranges.
+    func clearHistory(since date: Date) {
+        history.removeAll { $0.lastVisit >= date }
+        reindex()
+        historyDirty = true
+        flush()
+    }
+
+    func removeHistory(urls: Set<String>) {
+        guard !urls.isEmpty else { return }
+        history.removeAll { urls.contains($0.url) }
+        reindex()
+        historyDirty = true
+        flush()
+    }
+
     /// Merge imported history idempotently: repeated imports do not inflate visit counts.
     /// Existing Facet activity wins when it is newer; otherwise imported title/date fill in.
     @discardableResult
@@ -108,6 +131,37 @@ final class Store {
         }
         if !entries.isEmpty { historyDirty = true }
         return added
+    }
+
+    /// Frecency-ranked matches over bookmarks and history, with titles, for the omnibox.
+    func rankedEntries(for query: String, limit: Int = 8) -> [(entry: HistoryEntry, bookmarked: Bool)] {
+        let q = query.lowercased().trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return [] }
+        let now = Date()
+        var scored: [(HistoryEntry, Bool, Double)] = []
+        var seen = Set<String>()
+        let bookmarkURLs = Set(bookmarks.map(\.url))
+        for e in bookmarks + history {
+            let display = Store.displayForm(e.url)
+            if seen.contains(display) { continue }
+            let hay = display.lowercased()
+            let bare = hay.hasPrefix("www.") ? String(hay.dropFirst(4)) : hay
+            let titleHit = e.title.lowercased().contains(q)
+            let urlHit = hay.range(of: q)
+            guard urlHit != nil || titleHit else { continue }
+            seen.insert(display)
+            let bookmarked = bookmarkURLs.contains(e.url)
+            var score = Double(max(1, e.visits)) + (bookmarked ? 4 : 0)
+            // Prefix matches on the host beat matches buried in a path or query string.
+            if bare.hasPrefix(q) || hay.hasPrefix(q) { score *= 6 }
+            else if let r = urlHit, hay.distance(from: hay.startIndex, to: r.lowerBound) < 12 { score *= 2 }
+            if titleHit { score += 2 }
+            let ageDays = now.timeIntervalSince(e.lastVisit) / 86_400
+            score /= (1 + max(0, ageDays) * 0.25)
+            if display.count < 40 { score *= 1.3 }  // prefer clean landing pages
+            scored.append((e, bookmarked, score))
+        }
+        return scored.sorted { $0.2 > $1.2 }.prefix(limit).map { ($0.0, $0.1) }
     }
 
     /// Frecency-ranked prefix/substring match over history + bookmarks, for the URL bar.
@@ -156,19 +210,43 @@ final class Store {
     func toggleBookmark(url: URL, title: String) -> Bool {
         if let i = bookmarks.firstIndex(where: { $0.url == url.absoluteString }) {
             bookmarks.remove(at: i)
-            write(bookmarks, to: bookmarksURL)
+            saveBookmarks()
             return false
         }
         bookmarks.append(HistoryEntry(url: url.absoluteString, title: title.isEmpty ? url.host ?? "" : title,
                                       visits: 1, lastVisit: Date()))
-        write(bookmarks, to: bookmarksURL)
+        saveBookmarks()
         return true
     }
 
     func removeBookmark(at index: Int) {
         guard bookmarks.indices.contains(index) else { return }
         bookmarks.remove(at: index)
+        saveBookmarks()
+    }
+
+    func removeBookmarks(urls: Set<String>) {
+        guard !urls.isEmpty else { return }
+        bookmarks.removeAll { urls.contains($0.url) }
+        saveBookmarks()
+    }
+
+    func renameBookmark(url: String, title: String) {
+        guard let i = bookmarks.firstIndex(where: { $0.url == url }) else { return }
+        let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        bookmarks[i].title = clean.isEmpty ? (URL(string: url)?.host ?? url) : clean
+        saveBookmarks()
+    }
+
+    func moveBookmark(from: Int, to: Int) {
+        guard bookmarks.indices.contains(from), bookmarks.indices.contains(to), from != to else { return }
+        bookmarks.insert(bookmarks.remove(at: from), at: to)
+        saveBookmarks()
+    }
+
+    private func saveBookmarks() {
         write(bookmarks, to: bookmarksURL)
+        NotificationCenter.default.post(name: .facetBookmarksChanged, object: nil)
     }
 
     /// Merge imported bookmarks by URL. Facet's existing title is preserved unless blank.
@@ -188,7 +266,7 @@ final class Store {
                 added += 1
             }
         }
-        if !entries.isEmpty { write(bookmarks, to: bookmarksURL) }
+        if !entries.isEmpty { saveBookmarks() }
         return added
     }
 
@@ -200,6 +278,7 @@ final class Store {
         func encodeTab(_ t: SavedTab) -> [String: Any] {
             var d: [String: Any] = ["url": t.url, "title": t.title]
             if let state = t.interactionState { d["state"] = state.base64EncodedString() }
+            if t.pinned { d["pinned"] = true }
             return d
         }
         let encoded: [[String: Any]] = windows.map { w in
@@ -219,7 +298,8 @@ final class Store {
             arr.compactMap { e in
                 guard let url = e["url"] as? String, !url.isEmpty else { return nil }
                 let state = (e["state"] as? String).flatMap { Data(base64Encoded: $0) }
-                return SavedTab(url: url, title: e["title"] as? String ?? "", interactionState: state)
+                return SavedTab(url: url, title: e["title"] as? String ?? "", interactionState: state,
+                                pinned: e["pinned"] as? Bool ?? false)
             }
         }
         func decodeFrame(_ any: Any?) -> NSRect? {
@@ -249,7 +329,15 @@ final class Store {
         guard historyDirty else { return }
         historyDirty = false
         if history.count > maxHistory {
-            history = history.sorted { ($0.visits, $0.lastVisit) > ($1.visits, $1.lastVisit) }
+            // Ranking by visit count alone would discard every new site once the list filled
+            // with repeat visits (an import does that at once). Keep the last day outright,
+            // then whatever the omnibox's frecency still ranks highest.
+            let now = Date()
+            func keep(_ e: HistoryEntry) -> Double {
+                let ageDays = max(0, now.timeIntervalSince(e.lastVisit) / 86_400)
+                return ageDays < 1 ? .infinity : Double(max(1, e.visits)) / (1 + ageDays * 0.25)
+            }
+            history = history.sorted { (keep($0), $0.lastVisit) > (keep($1), $1.lastVisit) }
                 .prefix(maxHistory).map { $0 }
             reindex()
         }

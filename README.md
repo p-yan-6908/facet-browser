@@ -101,19 +101,28 @@ position, a couple of KB. Click the tab and it comes back where you left it. Chr
 and Safari only throttle timers; the ~50–300 MB per tab stays resident.
 
 Sleeping also happens immediately when macOS reports memory pressure, so Facet
-gives memory back to the system instead of competing for it.
+gives memory back to the system instead of competing for it. A window nobody can see
+(minimized, hidden, or fully covered) lets even its front tab sleep after the same idle
+time, and wakes it the moment the window is visible again. When macOS kills a background
+renderer to reclaim memory, Facet leaves that tab asleep instead of instantly reloading it
+and spending the memory the system just asked for.
 
 **3. Ad and tracker blocking in the network layer.** 214 domain rules are compiled
 once into a WebKit bytecode program that runs inside the networking process, so
 blocked requests never reach the renderer at all. This is cheaper *and* stronger
 than an extension: no JS, no per-request callback, nothing to run per page. Verified
-with `tools/run-blocktest.sh`.
+with `tools/run-blocktest.sh`. When a site breaks, click the shield and untick **Block Ads
+on *site***: blocking stops for that site and its subdomains, and only its pages reload.
 
 **4. A new tab costs nothing.** The new-tab page is drawn with AppKit, so an empty
 tab allocates no web process. Restoring a session is lazy too — a 20-tab window
 comes back with exactly one live renderer.
 
-Autoplay is off, which removes most background CPU and video decode memory.
+Autoplay is off, which removes most background CPU and video decode memory. Favicons are
+redrawn into one 32px bitmap before they are kept (a site's 512px touch icon would
+otherwise pin megabytes per tab) and cached as tiny PNGs, so restored sleeping tabs show
+their icons without a renderer or a network request. Tab context menus are built when they
+open, not on every page-load progress tick.
 
 **5. An app-global adaptive RAM budget.** **Facet → Settings… → Memory** sets a target across every
 Facet window (750 MB, 1 GB, 1.5 GB, 2 GB, 3 GB, or off). Facet now measures
@@ -125,7 +134,11 @@ Tabs playing/capturing media, tabs marked **Keep Tab Awake**, visible tabs, and 
 leases are protected. The selected number is a target rather than an absolute OS kill-limit; a
 single foreground site can itself exceed it.
 
-**6. A RAM-aware browser agent.** **View → AI Agent…** (⌘⇧K) toggles a native AppKit sidebar
+**6. A RAM-aware browser agent.** *Currently parked:* builds hide the agent's menu item, toolbar
+button, sidebar, context-menu entries and Settings pane while work focuses on the browser
+itself. Set `Config.agentFeatureAvailable` to `true` in `Sources/Config.swift` and rebuild to
+bring it back; the regression suite keeps testing it either way. When enabled,
+**View → AI Agent…** (⌘⇧K) toggles a native AppKit sidebar
 inside the active browser window—there is no extra WebKit renderer for the assistant UI. The
 model runs in the cloud while Facet exposes lightweight tools for tabs, navigation, compact
 semantic page snapshots, click/fill/key/scroll actions, and an on-demand viewport screenshot
@@ -134,6 +147,15 @@ page mutates. Agent page leases remain bounded by `agentMaxLiveTabs` (default 1)
 were asleep before an agent lease return to sleep when released. Private windows are never
 exposed to the agent.
 
+Each request tells the model which tab you are looking at (as data, never as instructions),
+so "summarize this page" works without an extra tool call. The sidebar has one-click
+**Summarize page**, **Key facts**, and **Compare tabs** actions; right-clicking a selection
+offers **Ask Assistant About Selection**, and right-clicking a page offers **Summarize Page
+with Assistant**. Replies render inline Markdown, and their links open as background tabs.
+The agent can also go back in a tab's history and choose `<select>` options by their visible
+text. With Anthropic providers, each tool step marks the conversation as a prompt-cache
+breakpoint, so later steps do not pay full price to resend earlier page snapshots.
+
 Conversation context is multi-turn but session-only: it stays in memory for follow-up requests
 until **Clear** or quit, is bounded by count/size, and is rolled back when a task is stopped or
 fails. Password, one-time-code, and payment-field values are redacted from semantic snapshots.
@@ -141,7 +163,10 @@ The screenshot fallback is generated only when requested, sent for that visual i
 not persisted to disk or transcript history.
 
 Browser-changing actions support **Deny**, **Allow Once**, **Allow This Site**, and **Allow Safe
-Actions This Task**. There is also an explicit **YOLO This Task** mode with a second critical
+Actions This Task**. Only clicks on plain web links count as safe: clicks on buttons and form
+controls, filling fields, key presses and closing tabs ask every time. Safe-action approval
+covers sites already approved in the task, so opening a new site still asks, because a URL the
+model writes could carry page text to that site. There is also an explicit **YOLO This Task** mode with a second critical
 warning; when enabled, future browser-changing actions for that one task no longer prompt. YOLO
 resets before the next task and still cannot expose private windows, reveal redacted credential
 fields, bypass URL-scheme/credential safety checks, or undo completed actions.
@@ -162,6 +187,47 @@ grant for model inference**. OpenAI's public Sign in with ChatGPT flow is identi
 partners, and Anthropic documents Claude Pro/Max subscription OAuth for Claude Code rather than a
 general third-party inference client. If either provider issues Facet/you an approved native-app
 OAuth client, the PKCE plumbing is ready to use it directly without a coding CLI.
+
+## Everyday browsing, Chrome-style
+
+The things people reach for in Chrome, done natively and without extra processes:
+
+- **Omnibox.** A dropdown with search, the typed address, matching **open tabs (Switch to
+  Tab)**, bookmarks and history, ranked by frequency and recency. It also completes inline:
+  type `gi` and it offers `github.com` with the rest selected. Inline completion only
+  suggests addresses you have visited more than once or bookmarked, so a search is never
+  hijacked by a one-off visit. Arrow keys move through the list, Escape reverts, and ⌘Return
+  opens the result in a new tab. No keystrokes go to a suggestion server.
+- **Downloads.** Files the page cannot display, `Content-Disposition: attachment`,
+  `<a download>`, ⌥-click, and the context menu all download to ~/Downloads. A toolbar button
+  with a progress ring opens a list where you can cancel, resume, retry, open, or show files
+  in Finder. Finished files are quarantined so Gatekeeper checks downloaded apps, as Safari
+  and Chrome do, and the Dock's Downloads stack bounces. A tab that only existed to start a
+  download closes itself.
+- **Pages that work.** File uploads (`<input type=file>`), HTTP Basic/Digest sign-in
+  prompts, fullscreen video, Print (⌘P), Save Page As (web archive), Export as PDF, and Web
+  Inspector (⌥⌘I).
+- **Tabs.** Pin tabs (they persist), mute tabs from the speaker icon, open links next to
+  the page that opened them, return to the opener when you close its last child tab, move a
+  tab to a new window without reloading it, close tabs to the right, and duplicate a tab with
+  its history. Hold or right-click Back/Forward to see the history list.
+- **Finding things.** Find as you type, with a match count. ⌘E finds the current selection.
+  History (⌘Y) and Bookmarks (⌥⌘B) open in a native, searchable window where you can delete
+  entries and rename bookmarks. A bookmarks bar (⌘⇧B) has an overflow menu.
+- **Per-site memory.** Zoom uses Chrome's steps and is remembered per site. Camera and
+  microphone decisions can be remembered per site. Pages that try to open another app
+  (`zoommtg:`, `mailto:`, ...) ask first, with an "always allow" option.
+- **Clear Browsing Data (⌘⇧⌫).** Time ranges from the last hour to all time. Choose any of
+  history, cookies and site data, cached files, and site settings.
+- **Polish.** Hovering a link shows its address bottom-left. Context menus offer Open Link
+  in New Tab/Window/Private Window, and search the selection with your engine. Error pages
+  name the host, and Reload retries the real address. Repeated JavaScript dialogs can be
+  suppressed, and a page crashing in a loop stops reloading itself. Private windows share
+  one ephemeral session, like incognito, which is discarded when the last one closes.
+
+The link-hover and context-menu details come from a script in WebKit's isolated
+`defaultClient` world. Page scripts see the same DOM events but cannot reach its message
+handler, so a page cannot spoof what the status bubble shows or what a menu command acts on.
 
 ### Compare it against your own browser
 
@@ -202,25 +268,32 @@ To make it your default browser: **Facet → Make Facet the Default Browser**.
 
 | | |
 |---|---|
-| `⌘L` | address bar (history/bookmark autocomplete, no network suggestions) |
+| `⌘L` | address bar (inline completion, open tabs, bookmarks, history; no network suggestions) |
+| `⌘Return` (in the address bar) | open in a new tab |
 | `⌘T` / `⌘W` | new tab / close tab |
 | `⌘⇧T` | reopen the tab you just closed |
 | `⌘N` / `⌘⇧N` | new window / new private window |
-| `^⇥` / `^⇧⇥` | next / previous tab (also `⌘⌥←` / `⌘⌥→`) |
+| `^⇥` / `^⇧⇥` | next / previous tab (also `⌘⌥→` / `⌘⌥←`) |
 | `⌘1`–`⌘9` | jump to tab |
-| `⌘[` / `⌘]` | back / forward (or two-finger swipe) |
-| `⌘R` / `⌘.` | reload / stop |
-| `⌘F` / `⌘G` / `⌘⇧G` | find, find next, find previous |
-| `⌘D` | bookmark |
-| `⌘+` / `⌘-` / `⌘0` | zoom |
+| `⌘[` / `⌘]` | back / forward (or two-finger swipe; hold the button for history) |
+| `⌘R` / `⌘⇧R` / `⌘.` | reload / reload bypassing the cache / stop |
+| `⌘F` / `⌘G` / `⌘⇧G` / `⌘E` | find as you type, next, previous, find the selection |
+| `⌘D` / `⌘⇧B` / `⌥⌘B` | bookmark / bookmarks bar / bookmark manager |
+| `⌘Y` | history |
+| `⌘⇧⌫` | clear browsing data |
+| `⌘+` / `⌘-` / `⌘0` | zoom (remembered per site) |
+| `⌘P` / `⌘S` | print / save page as |
+| `⌥⌘I` | Web Inspector |
 | `⌘⇧H` | put all background tabs to sleep now |
-| `⌘⇧J` | open Downloads folder |
-| `⌘⇧K` | open the RAM-aware AI agent |
+| `⌘⇧J` / `⌥⌘L` | downloads list / Downloads folder |
+| `⌘⇧K` | open the RAM-aware AI agent (while the agent is enabled; it is currently parked) |
 | `⌘,` | open the native Settings window |
 
-**Mouse.** Middle-click or ⌘-click a link opens it in a background tab.
-Middle-click a tab closes it. **Drag a tab** to reorder it. **Right-click a tab** for
-reload, duplicate, copy address, put-to-sleep, close and close-others. Double-click
+**Mouse.** Middle-click or ⌘-click a link opens it in a background tab next to the
+current one; ⌥-click downloads it. Middle-click a tab closes it. **Drag a tab** to reorder
+it; pinned tabs stay at the front. Click a tab's speaker icon to mute it. **Right-click a
+tab** to reload, duplicate, pin, mute, copy its address, keep it awake, put it to sleep, move
+it to a new window, or close it, other tabs, or tabs to the right. Double-click
 empty space in the tab strip for a new tab. Right-click a page → Inspect Element
 opens Web Inspector.
 
@@ -235,7 +308,7 @@ currently asleep — hover it for the per-process breakdown.
 ## Settings and configuration
 
 **Facet → Settings…** (⌘,) opens the native settings window with **General**, **Memory**,
-**Agent**, **Import**, and **Privacy** sections. Most changes apply immediately. The underlying
+**Import**, and **Privacy** sections (plus **Agent** while the agent is enabled). Most changes apply immediately. The underlying
 `~/Library/Application Support/Facet/config.json` remains a plain-text backing store
 for advanced/manual editing, while API keys stay in memory and OAuth tokens stay in Keychain.
 
@@ -295,12 +368,13 @@ uses a loopback-only test site and a nonpersistent WebKit store. See
 | `searchTemplate` | Google | `%s` is the query; e.g. `https://duckduckgo.com/?q=%s` |
 | `hibernateAfterMinutes` | `5` | `0` disables sleeping |
 | `hibernateOnMemoryPressure` | `true` | sleep everything when macOS says it is low |
-| `blockAdsAndTrackers` | `true` | also the shield button in the toolbar |
+| `blockAdsAndTrackers` | `true` | also the shield menu in the toolbar, which can turn blocking off for one site |
 | `restoreSessionOnLaunch` | `true` | |
 | `showMemoryReadout` | `true` | |
 | `enableDeveloperTools` | `true` | |
+| `showBookmarksBar` | `false` | also **View → Always Show Bookmarks Bar** (⌘⇧B) |
 | `memoryBudgetMB` | `1536` | app-global RAM target; `0` disables enforcement |
-| `agentEnabled` | `true` | enable the native AI agent sidebar |
+| `agentEnabled` | `true` | enable the native AI agent sidebar (has no effect while the agent is parked) |
 | `agentProvider` | `openai` | `openai`, `anthropic`, `openai_oauth`, or `anthropic_oauth` |
 | `agentBaseURL` | `https://api.openai.com/v1` | base URL or full Responses/Messages endpoint for direct API providers |
 | `agentModel` | `gpt-5.6-luna` | model/alias for the selected provider |
@@ -308,8 +382,11 @@ uses a loopback-only test site and a nonpersistent WebKit store. See
 | `agentOpenAIOAuth*` / `agentAnthropicOAuth*` | blank | provider-issued authorization URL, token URL, client ID and scopes for OAuth modes |
 
 Same folder holds `blocked-domains.txt` (one domain per line, `#` comments — add
-your own and restart), `history.json`, `bookmarks.json` and `session.json`. All
-plain files; nothing is a database.
+your own and restart; hosts-file lines such as `0.0.0.0 ads.example.com` work too, so a
+published hosts list can be pasted in), `history.json`, `bookmarks.json`, `session.json`,
+`site-settings.json` (per-site zoom, remembered permissions and sites with blocking off) and
+`Favicons/` (32px PNGs). All plain files; nothing is a database. Set `FACET_PROFILE_DIR` to run Facet against
+a throwaway profile folder instead.
 
 ## Layout
 
@@ -330,8 +407,15 @@ plain files; nothing is a database.
 | `Sources/BrowserImportService.swift` | bookmark/history migration and optional Chrome session import |
 | `Sources/BrowserSQLite.swift` | short-lived read-only WAL snapshots for browser imports |
 | `Sources/ChromeSessionImport.swift` | authorized Chrome cookie decryption, filtering, and WebKit installation |
-| `Sources/TabStrip.swift` | hand-drawn tab strip, tab context menu |
-| `Sources/Controls.swift` | toolbar buttons, address bar, status pill |
+| `Sources/TabStrip.swift` | hand-drawn tab strip: pinned tabs, audio/mute, drag to reorder |
+| `Sources/Controls.swift` | toolbar buttons (with history menus), address bar, status pill, link status |
+| `Sources/Omnibox.swift` | address-bar ranking, inline completion, dropdown |
+| `Sources/WebView.swift` | isolated-world page bridge, context-menu hook, closure menu items |
+| `Sources/Downloads.swift` / `DownloadsView.swift` | download tracking, quarantine, toolbar popover |
+| `Sources/BookmarksBar.swift` | bookmarks bar |
+| `Sources/LibraryWindowController.swift` | native History and Bookmarks window |
+| `Sources/SiteSettings.swift` | per-site zoom and permission memory |
+| `Sources/FaviconStore.swift` | bounded in-memory and on-disk favicon cache |
 | `Sources/StartView.swift` | native new-tab page |
 | `Sources/Store.swift` | history, bookmarks, session (flat JSON) |
 | `tools/run-blocktest.sh` | functional test: are trackers actually blocked? |
@@ -348,6 +432,10 @@ plain files; nothing is a database.
 - **Not a new engine.** Site compatibility is Safari's. The rare site that only
   works in Chrome will not work here.
 - **No extension support.** Ad blocking is built in; anything else is not available.
+- **No password manager, autofill, sync, or web notifications.** WKWebView does not expose
+  iCloud Keychain AutoFill or Web Push to third-party browsers, and Facet does not store
+  passwords itself.
+- **No drag-a-tab-out.** Use **Move Tab to New Window** instead.
 - **Local builds are ad-hoc signed.** Tagged GitHub releases are notarized only when the
   repository has the required Apple Developer secrets configured; see `docs/releasing.md`.
 - Cosmetic ad rules are deliberately conservative, so some blocked slots leave a gap.

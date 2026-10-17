@@ -7,24 +7,30 @@ protocol TabStripDelegate: AnyObject {
     /// Title/handler pairs for a tab's right-click menu; "-" means a separator.
     func tabStripContextActions(index: Int) -> [(String, () -> Void)]
     func tabStripDidRequestMove(from: Int, to: Int)
+    func tabStripDidToggleMute(index: Int)
 }
 
 /// One view per tab, everything drawn by hand. A stock NSTableView or NSSegmented
 /// control would add layers, cells and layout passes we do not need.
 final class TabItemView: NSView {
-    var title: String = "" { didSet { needsDisplay = true } }
-    var favicon: NSImage? { didSet { needsDisplay = true } }
-    var isSelected = false { didSet { needsDisplay = true } }
-    var isHibernated = false { didSet { needsDisplay = true } }
-    var isLoading = false { didSet { needsDisplay = true } }
-    var progress: Double = 0 { didSet { if isLoading { needsDisplay = true } } }
-    var isPrivate = false { didSet { needsDisplay = true } }
+    var title: String = "" { didSet { if title != oldValue { needsDisplay = true } } }
+    var favicon: NSImage? { didSet { if favicon !== oldValue { needsDisplay = true } } }
+    var isSelected = false { didSet { if isSelected != oldValue { needsDisplay = true } } }
+    var isHibernated = false { didSet { if isHibernated != oldValue { needsDisplay = true } } }
+    var isLoading = false { didSet { if isLoading != oldValue { needsDisplay = true } } }
+    var progress: Double = 0 { didSet { if isLoading && progress != oldValue { needsDisplay = true } } }
+    var isPrivate = false { didSet { if isPrivate != oldValue { needsDisplay = true } } }
+    var isPinned = false { didSet { if isPinned != oldValue { needsDisplay = true } } }
+    var isAudible = false { didSet { if isAudible != oldValue { needsDisplay = true } } }
+    var isMuted = false { didSet { if isMuted != oldValue { needsDisplay = true } } }
 
     private var hovering = false { didSet { needsDisplay = true } }
-    private var closeHovering = false { didSet { needsDisplay = true } }
+    private var closeHovering = false { didSet { if closeHovering != oldValue { needsDisplay = true } } }
     var onSelect: (() -> Void)?
     var onClose: (() -> Void)?
-    var contextActions: [(String, () -> Void)] = []
+    var onToggleMute: (() -> Void)?
+    /// Built when the menu opens, not on every state change of every tab.
+    var contextActionsProvider: (() -> [(String, () -> Void)])?
     /// Drag-to-reorder. The strip owns the reordering logic; the item only reports
     /// where the press started and where the pointer is now.
     var onDragBegan: ((CGFloat) -> Void)?      // press x within this item
@@ -35,10 +41,14 @@ final class TabItemView: NSView {
 
     override var isFlipped: Bool { true }
 
-    private var showsTitle: Bool { bounds.width >= 76 }
-    private var showsClose: Bool { bounds.width >= 58 && (hovering || isSelected) }
+    private var showsTitle: Bool { !isPinned && bounds.width >= 76 }
+    private var showsClose: Bool { !isPinned && bounds.width >= 58 && (hovering || isSelected) }
+    private var showsAudio: Bool { (isAudible || isMuted) && !isPinned && bounds.width >= 64 }
     private var closeRect: NSRect {
         NSRect(x: bounds.maxX - 22, y: (bounds.height - 16) / 2, width: 16, height: 16)
+    }
+    private var audioRect: NSRect {
+        NSRect(x: bounds.maxX - (showsClose ? 42 : 24), y: (bounds.height - 16) / 2, width: 16, height: 16)
     }
 
     override func updateTrackingAreas() {
@@ -54,7 +64,7 @@ final class TabItemView: NSView {
     override func mouseEntered(with event: NSEvent) { hovering = true }
     override func mouseExited(with event: NSEvent) { hovering = false; closeHovering = false }
     override func mouseMoved(with event: NSEvent) {
-        closeHovering = closeRect.contains(convert(event.locationInWindow, from: nil))
+        closeHovering = showsClose && closeRect.contains(convert(event.locationInWindow, from: nil))
     }
 
     private var pressPoint: NSPoint?
@@ -63,6 +73,7 @@ final class TabItemView: NSView {
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
         if showsClose, closeRect.contains(p) { onClose?(); return }
+        if showsAudio, audioRect.contains(p) { onToggleMute?(); return }
         if event.type == .otherMouseDown { onClose?(); return }
         pressPoint = p
         onSelect?()   // select on press, like Safari, so dragging the current tab feels direct
@@ -86,21 +97,23 @@ final class TabItemView: NSView {
     override func otherMouseDown(with event: NSEvent) { onClose?() }  // middle-click closes
 
     override func rightMouseDown(with event: NSEvent) {
-        guard !contextActions.isEmpty else { return super.rightMouseDown(with: event) }
+        let actions = contextActionsProvider?() ?? []
+        guard !actions.isEmpty else { return super.rightMouseDown(with: event) }
         let menu = NSMenu()
-        for (i, entry) in contextActions.enumerated() {
+        for entry in actions {
             if entry.0 == "-" { menu.addItem(.separator()); continue }
-            let item = NSMenuItem(title: entry.0, action: #selector(runContextAction(_:)), keyEquivalent: "")
-            item.target = self
-            item.tag = i
-            menu.addItem(item)
+            menu.addItem(ClosureMenuItem(entry.0, handler: entry.1))
         }
         NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
 
-    @objc private func runContextAction(_ sender: NSMenuItem) {
-        guard contextActions.indices.contains(sender.tag) else { return }
-        contextActions[sender.tag].1()
+    private func drawSymbol(_ name: String, in rect: NSRect, color: NSColor, pointSize: CGFloat) {
+        let cfg = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .semibold)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [color]))
+        guard let img = NSImage(systemSymbolName: name, accessibilityDescription: nil)?.withSymbolConfiguration(cfg) else { return }
+        let s = img.size
+        let r = NSRect(x: rect.midX - s.width / 2, y: rect.midY - s.height / 2, width: s.width, height: s.height)
+        img.draw(in: r, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -118,8 +131,8 @@ final class TabItemView: NSView {
             path.fill()
         }
 
-        var x = r.minX + 8.0
         let iconSize: CGFloat = 16
+        var x = isPinned ? floor(bounds.midX - iconSize / 2) : r.minX + 8.0
         let iconY = (bounds.height - iconSize) / 2
 
         if isLoading {
@@ -131,21 +144,16 @@ final class TabItemView: NSView {
             ring.lineWidth = 2
             ring.stroke()
             let arc = NSBezierPath()
-            arc.appendArc(withCenter: c, radius: 6, startAngle: 90,
-                          endAngle: 90 - CGFloat(360 * max(0.08, progress)), clockwise: true)
+            arc.appendArc(withCenter: c, radius: 6, startAngle: -90,
+                          endAngle: -90 + CGFloat(360 * max(0.08, progress)), clockwise: false)
             NSColor.controlAccentColor.setStroke()
             arc.lineWidth = 2
             arc.stroke()
             x += iconSize + 6
         } else if let icon = favicon {
             let rect = NSRect(x: x, y: iconY, width: iconSize, height: iconSize)
-            if isHibernated {
-                NSGraphicsContext.current?.saveGraphicsState()
-                icon.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 0.45)
-                NSGraphicsContext.current?.restoreGraphicsState()
-            } else {
-                icon.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1)
-            }
+            icon.draw(in: rect, from: .zero, operation: .sourceOver, fraction: isHibernated ? 0.45 : 1,
+                      respectFlipped: true, hints: nil)
             x += iconSize + 6
         } else {
             // Letter tile fallback so tabs never look empty.
@@ -164,8 +172,18 @@ final class TabItemView: NSView {
             x += iconSize + 6
         }
 
+        if isPinned && (isAudible || isMuted) {
+            // Pinned tabs have no room for the button, so show a small badge on the icon.
+            let badge = NSRect(x: bounds.midX + 3, y: iconY - 4, width: 11, height: 11)
+            NSColor.controlBackgroundColor.setFill()
+            NSBezierPath(ovalIn: badge.insetBy(dx: -1, dy: -1)).fill()
+            drawSymbol(isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill", in: badge,
+                       color: .secondaryLabelColor, pointSize: 7)
+        }
+
         if showsTitle {
-            let rightPad: CGFloat = showsClose ? 26 : 8
+            var rightPad: CGFloat = showsClose ? 26 : 8
+            if showsAudio { rightPad += 20 }
             let width = max(0, r.maxX - x - rightPad)
             if width > 8 {
                 let color: NSColor = isSelected ? .labelColor
@@ -188,6 +206,11 @@ final class TabItemView: NSView {
             let dot = NSBezierPath(ovalIn: NSRect(x: r.minX + 3, y: r.minY + 3, width: 5, height: 5))
             NSColor.systemPurple.setFill()
             dot.fill()
+        }
+
+        if showsAudio {
+            drawSymbol(isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill", in: audioRect,
+                       color: isMuted ? .tertiaryLabelColor : .secondaryLabelColor, pointSize: 10)
         }
 
         if showsClose {
@@ -219,6 +242,9 @@ final class TabStripView: NSView {
     private var dragGrabX: CGFloat = 0     // where in the tab the press landed
     private var dragPointerX: CGFloat = 0  // pointer, strip coordinates
 
+    private let buttonWidth: CGFloat = 28
+    private let pinnedWidth: CGFloat = 40
+
     override var isFlipped: Bool { true }
 
     override init(frame frameRect: NSRect) {
@@ -242,10 +268,8 @@ final class TabStripView: NSView {
     func update(tabs: [Tab], selected: Int) {
         if items.count != tabs.count {
             items.forEach { $0.removeFromSuperview() }
-            items = tabs.indices.map { i in
+            items = tabs.indices.map { _ in
                 let v = TabItemView()
-                v.onSelect = { [weak self] in self?.delegate?.tabStripDidSelect(index: i) }
-                v.onClose = { [weak self] in self?.delegate?.tabStripDidRequestClose(index: i) }
                 addSubview(v)
                 return v
             }
@@ -254,6 +278,11 @@ final class TabStripView: NSView {
             let v = items[i]
             v.onSelect = { [weak self] in self?.delegate?.tabStripDidSelect(index: i) }
             v.onClose = { [weak self] in self?.delegate?.tabStripDidRequestClose(index: i) }
+            v.onToggleMute = { [weak self] in self?.delegate?.tabStripDidToggleMute(index: i) }
+            v.contextActionsProvider = { [weak self] in self?.delegate?.tabStripContextActions(index: i) ?? [] }
+            v.onDragBegan = { [weak self] grabX in self?.beginDrag(i, grabX: grabX) }
+            v.onDragChanged = { [weak self] p in self?.updateDrag(p) }
+            v.onDragEnded = { [weak self] in self?.endDrag() }
             v.title = tab.displayTitle
             v.favicon = tab.favicon
             v.isSelected = (i == selected)
@@ -261,45 +290,59 @@ final class TabStripView: NSView {
             v.isLoading = tab.isLoading
             v.progress = tab.progress
             v.isPrivate = tab.isPrivate
-            v.contextActions = delegate?.tabStripContextActions(index: i) ?? []
-            v.onDragBegan = { [weak self] grabX in self?.beginDrag(i, grabX: grabX) }
-            v.onDragChanged = { [weak self] p in self?.updateDrag(p) }
-            v.onDragEnded = { [weak self] in self?.endDrag() }
-            v.toolTip = tab.isHibernated
+            v.isPinned = tab.isPinned
+            v.isAudible = tab.isPlayingAudio
+            v.isMuted = tab.isMuted
+            let tip = tab.isHibernated
                 ? "\(tab.displayTitle) \u{2014} sleeping (0 MB)"
-                : tab.url?.absoluteString ?? tab.displayTitle
+                : (tab.isPinned ? tab.displayTitle : tab.url?.absoluteString ?? tab.displayTitle)
+            if v.toolTip != tip { v.toolTip = tip }
         }
         layoutTabs()
     }
 
-    /// Width per tab. Tabs shrink as far as they must so that every tab stays on
-    /// screen and clickable -- a lower bound here would push the last tabs past the
-    /// window edge where they cannot be reached at all.
-    private func tabWidth(available: CGFloat) -> CGFloat {
-        guard !items.isEmpty else { return 0 }
-        return min(210, available / CGFloat(items.count))
+    /// Every slot, left to right. Pinned tabs are a fixed icon width; the rest share what
+    /// is left. Tabs shrink as far as they must so every tab stays on screen and
+    /// clickable -- a lower bound would push the last tabs past the window edge.
+    private func slotFrames() -> [NSRect] {
+        let available = max(0, bounds.width - buttonWidth - 4)
+        let pinned = items.filter(\.isPinned).count
+        let unpinned = items.count - pinned
+        let pw = pinned > 0 ? min(pinnedWidth, available / CGFloat(items.count)) : 0
+        let rest = max(0, available - pw * CGFloat(pinned))
+        let w = unpinned > 0 ? min(210, rest / CGFloat(unpinned)) : 0
+        var x: CGFloat = 0
+        return items.map { item in
+            let width = item.isPinned ? pw : w
+            defer { x += width }
+            return NSRect(x: x, y: 0, width: width, height: bounds.height)
+        }
+    }
+
+    /// Indices a tab may move between: pinned tabs stay among pinned tabs.
+    private func section(of index: Int) -> ClosedRange<Int> {
+        let pinned = items.filter(\.isPinned).count
+        return items[index].isPinned ? 0...max(0, pinned - 1) : min(pinned, items.count - 1)...(items.count - 1)
     }
 
     private func layoutTabs() {
-        let buttonW: CGFloat = 28
-        let available = max(0, bounds.width - buttonW - 4)
+        let frames = slotFrames()
         guard !items.isEmpty else {
-            newTabButton.frame = NSRect(x: 2, y: (bounds.height - 22) / 2, width: buttonW, height: 22)
+            newTabButton.frame = NSRect(x: 2, y: (bounds.height - 22) / 2, width: buttonWidth, height: 22)
             return
         }
-        let w = tabWidth(available: available)
-        var x: CGFloat = 0
-        for (i, v) in items.enumerated() {
-            if i == dragIndex { x += w; continue }   // positioned below, on top of the rest
-            v.frame = NSRect(x: x, y: 0, width: w, height: bounds.height)
-            x += w
-        }
+        for (i, v) in items.enumerated() where i != dragIndex { v.frame = frames[i] }
         if let d = dragIndex, items.indices.contains(d) {
-            let clamped = max(0, min(available - w, dragPointerX - dragGrabX))
-            items[d].frame = NSRect(x: clamped, y: 0, width: w, height: bounds.height)
+            let range = section(of: d)
+            let w = frames[d].width
+            let minX = frames[range.lowerBound].minX
+            let maxX = frames[range.upperBound].maxX - w
+            let x = max(minX, min(maxX, dragPointerX - dragGrabX))
+            items[d].frame = NSRect(x: x, y: 0, width: w, height: bounds.height)
         }
-        newTabButton.frame = NSRect(x: min(x + 3, bounds.width - buttonW - 2),
-                                    y: (bounds.height - 22) / 2, width: buttonW, height: 22)
+        let end = frames.last?.maxX ?? 0
+        newTabButton.frame = NSRect(x: min(end + 3, bounds.width - buttonWidth - 2),
+                                    y: (bounds.height - 22) / 2, width: buttonWidth, height: 22)
     }
 
     // MARK: - Drag to reorder
@@ -313,14 +356,15 @@ final class TabStripView: NSView {
     }
 
     private func updateDrag(_ pointerInWindow: NSPoint) {
-        guard let from = dragIndex else { return }
+        guard let from = dragIndex, items.indices.contains(from) else { return }
         dragPointerX = convert(pointerInWindow, from: nil).x
-        let available = max(0, bounds.width - 32)
-        let w = tabWidth(available: available)
-        guard w > 0 else { return }
-
-        let leadingEdge = dragPointerX - dragGrabX
-        let to = max(0, min(items.count - 1, Int(((leadingEdge + w / 2) / w).rounded(.down))))
+        let frames = slotFrames()
+        let center = dragPointerX - dragGrabX + frames[from].width / 2
+        let range = section(of: from)
+        var to = from
+        for i in range where frames[i].minX <= center && center < frames[i].maxX { to = i }
+        if center < frames[range.lowerBound].minX { to = range.lowerBound }
+        if center >= frames[range.upperBound].maxX { to = range.upperBound }
         if to != from {
             dragIndex = to
             // The delegate reorders and calls update(), which re-lays out around the
@@ -353,7 +397,7 @@ final class TabStripView: NSView {
 
 /// 2px determinate bar under the toolbar. Hidden at rest so there is nothing to animate.
 final class ProgressBar: NSView {
-    var progress: Double = 0 { didSet { needsDisplay = true } }
+    var progress: Double = 0 { didSet { if progress != oldValue { needsDisplay = true } } }
     var active = false { didSet { isHidden = !active; needsDisplay = true } }
 
     override func draw(_ dirtyRect: NSRect) {

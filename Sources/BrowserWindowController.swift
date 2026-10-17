@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 import WebKit
 
 final class FlippedView: NSView {
@@ -14,9 +15,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     private let root = FlippedView()
     private let tabStrip = TabStripView()
     private let toolbarRow = FlippedView()
+    private let bookmarksBar = BookmarksBarView()
     private let progressBar = ProgressBar()
     private let webContainer = FlippedView()
     private let startView = StartView()
+    private let linkStatus = LinkStatusView()
     private let agentSidebar = AgentSidebarView()
     private var agentSidebarVisible = false
     private let agentSidebarWidth: CGFloat = 360
@@ -29,9 +32,16 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     private var reloadButton: ToolbarButton!
     private var shieldButton: ToolbarButton!
     private var bookmarkButton: ToolbarButton!
+    private var assistantButton: ToolbarButton!
+    private var downloadsButton: DownloadsToolbarButton!
     private let urlBar = URLBar()
     private var urlField: URLField { urlBar.field }
     private let statusPill = StatusPill()
+    private let omnibox = OmniboxPopup()
+    /// What the user has typed, without any inline completion, for Escape to restore.
+    private var omniboxTyped = ""
+    private var omniboxTypedLength = 0
+    private var downloadsPopover: NSPopover?
 
     private let findRow = BarBackgroundView()
     private let findField = NSTextField()
@@ -40,19 +50,38 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     private var findNextButton: ToolbarButton!
     private let findDoneButton = NSButton()
     private var findVisible = false
+    private var findWork: DispatchWorkItem?
 
     private var hibernationTimer: Timer?
     private var memoryTimer: Timer?
     private var sessionSaveScheduled = false
-    private var suppressCompletion = false
     private var statusResetWork: DispatchWorkItem?
+    /// When the window stopped being visible (minimized, hidden, fully covered).
+    private var hiddenSince: Date?
+    private var observers: [NSObjectProtocol] = []
     /// Most recently closed tabs, for Reopen Closed Tab.
     private var closedTabs: [SavedTab] = []
 
-    private let chromeTopHeight: CGFloat = 36 + 38
+    private let tabRowHeight: CGFloat = 36
+    private let toolRowHeight: CGFloat = 38
+    private let bookmarksRowHeight: CGFloat = 28
+    private var bookmarksBarVisible: Bool { Config.shared.showBookmarksBar }
+    private var chromeTopHeight: CGFloat {
+        tabRowHeight + toolRowHeight + (bookmarksBarVisible ? bookmarksRowHeight : 0)
+    }
     private var findRowHeight: CGFloat { findVisible ? 34 : 0 }
 
+    /// Chrome's zoom levels, so ⌘+ and ⌘- land on the same familiar steps.
+    private static let zoomSteps: [CGFloat] = [0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3]
+
     var activeTab: Tab? { tabs.indices.contains(activeIndex) ? tabs[activeIndex] : nil }
+    private var pinnedCount: Int { tabs.prefix { $0.isPinned }.count }
+
+    /// True when this window's page is actually on screen, not minimized or fully covered.
+    var isContentVisible: Bool {
+        guard let w = window else { return false }
+        return w.isVisible && !w.isMiniaturized && w.occlusionState.contains(.visible)
+    }
 
     // MARK: - Init
 
@@ -83,6 +112,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         startMemoryReadout()
 
         Downloads.shared.statusHandler = { [weak self] msg in self?.showStatus(msg) }
+        observers.append(NotificationCenter.default.addObserver(forName: .facetDownloadsChanged, object: nil, queue: .main) { [weak self] _ in
+            self?.refreshDownloadsButton()
+        })
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -99,22 +131,36 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
 
         root.addSubview(tabStrip)
         root.addSubview(toolbarRow)
+        root.addSubview(bookmarksBar)
         root.addSubview(progressBar)
         root.addSubview(findRow)
         root.addSubview(hairline)
         root.addSubview(webContainer)
+        root.addSubview(linkStatus)
         root.addSubview(agentSidebar)
         agentSidebar.isHidden = true
         agentSidebar.onClose = { [weak self] in self?.setAgentSidebarVisible(false) }
+        linkStatus.isHidden = true
 
         tabStrip.delegate = self
         progressBar.active = false
         findRow.isHidden = true
 
-        backButton = ToolbarButton(symbol: "chevron.backward", tip: "Back (\u{2318}[)",
+        bookmarksBar.onOpen = { [weak self] url, inNewTab in
+            guard let self else { return }
+            if inNewTab { self.newTab(url: url, activate: false).ensureLoaded() } else { self.open(url) }
+        }
+        bookmarksBar.onOpenInNewWindow = { [weak self] url in
+            guard let self else { return }
+            AppDelegate.shared?.openInNewWindow(url, isPrivate: self.isPrivateWindow)
+        }
+
+        backButton = ToolbarButton(symbol: "chevron.backward", tip: "Back (\u{2318}[) \u{2014} hold for history",
                                    target: self, action: #selector(goBack))
-        forwardButton = ToolbarButton(symbol: "chevron.forward", tip: "Forward (\u{2318}])",
+        forwardButton = ToolbarButton(symbol: "chevron.forward", tip: "Forward (\u{2318}]) \u{2014} hold for history",
                                       target: self, action: #selector(goForward))
+        backButton.menuProvider = { [weak self] in self?.historyMenu(back: true) }
+        forwardButton.menuProvider = { [weak self] in self?.historyMenu(back: false) }
         reloadButton = ToolbarButton(symbol: "arrow.clockwise", tip: "Reload (\u{2318}R)",
                                      target: self, action: #selector(reloadOrStop))
         bookmarkButton = ToolbarButton(symbol: "star", tip: "Bookmark (\u{2318}D)",
@@ -122,25 +168,26 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         bookmarkButton.onTint = .systemYellow
         shieldButton = ToolbarButton(symbol: "shield.lefthalf.filled",
                                      tip: "Ad & tracker blocking",
-                                     target: self, action: #selector(toggleBlocking))
+                                     target: self, action: #selector(showBlockingMenu))
+        downloadsButton = DownloadsToolbarButton(symbol: "arrow.down.circle", tip: "Downloads (\u{2318}\u{21E7}J)",
+                                                 target: self, action: #selector(toggleDownloadsPopover))
+        assistantButton = ToolbarButton(symbol: "sparkles", tip: "Assistant (\u{2318}\u{21E7}K)",
+                                        target: self, action: #selector(assistantButtonPressed))
 
         urlField.delegate = self
         urlField.target = self
         urlField.action = #selector(urlFieldCommitted)
-        urlField.onCancel = { [weak self] in
-            guard let self else { return }
-            self.urlField.stringValue = self.activeTab?.url
-                .map { Store.displayForm($0.absoluteString) } ?? ""
-            self.focusWebContent()
-        }
+        urlField.onCancel = { [weak self] in self?.revertAddressBar() }
+        omnibox.onActivate = { [weak self] index in self?.activateSuggestion(at: index) }
 
         [backButton, forwardButton, reloadButton, urlBar, bookmarkButton,
-         shieldButton, statusPill].forEach { toolbarRow.addSubview($0!) }
+         shieldButton, downloadsButton, assistantButton, statusPill].forEach { toolbarRow.addSubview($0!) }
 
         // Find bar
         findField.placeholderString = "Find on page"
         findField.font = .systemFont(ofSize: 12)
         findField.bezelStyle = .roundedBezel
+        findField.delegate = self
         findField.target = self
         findField.action = #selector(findNext)
         findCount.font = .systemFont(ofSize: 11)
@@ -159,10 +206,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
 
         startView.onOpen = { [weak self] urlString in
             guard let self, let u = URL(string: urlString) else { return }
-            self.activeTab?.load(u)
-            self.refreshChrome()
-            self.attachActiveTab()
+            self.open(u)
         }
+        startView.onFocusAddressBar = { [weak self] in self?.focusURLField() }
     }
 
     override func windowDidLoad() { super.windowDidLoad() }
@@ -170,12 +216,14 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     private func layoutChrome() {
         let b = root.bounds
         let trafficLightInset: CGFloat = 82
-        let tabRow: CGFloat = 36
-        let toolRow: CGFloat = 40
 
         tabStrip.frame = NSRect(x: trafficLightInset, y: 0,
-                                width: max(0, b.width - trafficLightInset), height: tabRow)
-        toolbarRow.frame = NSRect(x: 0, y: tabRow, width: b.width, height: toolRow)
+                                width: max(0, b.width - trafficLightInset), height: tabRowHeight)
+        toolbarRow.frame = NSRect(x: 0, y: tabRowHeight, width: b.width, height: toolRowHeight)
+        bookmarksBar.isHidden = !bookmarksBarVisible
+        if bookmarksBarVisible {
+            bookmarksBar.frame = NSRect(x: 0, y: tabRowHeight + toolRowHeight, width: b.width, height: bookmarksRowHeight)
+        }
         progressBar.frame = NSRect(x: 0, y: chromeTopHeight - 3, width: b.width, height: 3)
 
         findRow.frame = NSRect(x: 0, y: chromeTopHeight, width: b.width, height: findRowHeight)
@@ -193,11 +241,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         agentSidebar.isHidden = !agentSidebarVisible
         startView.frame = webContainer.bounds
         activeTab?.webView?.frame = webContainer.bounds
+        layoutLinkStatus()
 
         // Toolbar row internals. Buttons get a 30x28 hit area so the hover highlight
         // reads as a real target rather than a tight box around the glyph.
         let bw: CGFloat = 30, bh: CGFloat = 28
-        let y = (toolRow - bh) / 2
+        let y = (toolRowHeight - bh) / 2
         backButton.frame = NSRect(x: 12, y: y, width: bw, height: bh)
         forwardButton.frame = NSRect(x: 44, y: y, width: bw, height: bh)
         reloadButton.frame = NSRect(x: 78, y: y, width: bw, height: bh)
@@ -206,10 +255,22 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         if Config.shared.showMemoryReadout {
             statusPill.isHidden = false
             let w = max(64, min(190, statusPill.fittingWidth))
-            statusPill.frame = NSRect(x: right - w, y: 0, width: w, height: toolRow)
+            statusPill.frame = NSRect(x: right - w, y: 0, width: w, height: toolRowHeight)
             right -= w + 4
         } else {
             statusPill.isHidden = true
+        }
+        let showAssistant = Config.shared.agentActive && !isPrivateWindow
+        assistantButton.isHidden = !showAssistant
+        if showAssistant {
+            assistantButton.frame = NSRect(x: right - bw, y: y, width: bw, height: bh)
+            right -= bw + 2
+        }
+        let showDownloads = !Downloads.shared.items.isEmpty
+        downloadsButton.isHidden = !showDownloads
+        if showDownloads {
+            downloadsButton.frame = NSRect(x: right - bw, y: y, width: bw, height: bh)
+            right -= bw + 2
         }
         shieldButton.frame = NSRect(x: right - bw, y: y, width: bw, height: bh)
         right -= bw + 2
@@ -218,7 +279,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
 
         let urlX: CGFloat = 116
         let fieldH: CGFloat = 28
-        urlBar.frame = NSRect(x: urlX, y: (toolRow - fieldH) / 2,
+        urlBar.frame = NSRect(x: urlX, y: (toolRowHeight - fieldH) / 2,
                               width: max(90, right - urlX), height: fieldH)
 
         // Find row internals
@@ -231,7 +292,23 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
-    func windowDidResize(_ notification: Notification) { layoutChrome() }
+    private func layoutLinkStatus() {
+        guard !linkStatus.text.isEmpty else { linkStatus.isHidden = true; return }
+        let area = webContainer.frame
+        let w = linkStatus.fittingWidth(max: max(120, area.width * 0.6))
+        linkStatus.frame = NSRect(x: area.minX + 4, y: area.maxY - 26, width: w, height: 22)
+        linkStatus.isHidden = false
+    }
+
+    /// Called when a setting changes the shape of the chrome, such as the bookmarks bar.
+    func chromeLayoutDidChange() {
+        layoutChrome()
+    }
+
+    func windowDidResize(_ notification: Notification) {
+        omnibox.hide()
+        layoutChrome()
+    }
 
     func windowDidBecomeKey(_ notification: Notification) {
         activeTab?.lastActive = Date()
@@ -239,10 +316,31 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         if agentSidebarVisible { agentSidebar.activate() }
     }
 
+    func windowDidResignKey(_ notification: Notification) {
+        omnibox.hide()
+    }
+
+    /// A window nobody can see does not need a live page. Its active tab may sleep after
+    /// the usual idle time, and wakes the moment the window is visible again.
+    func windowDidChangeOcclusionState(_ notification: Notification) {
+        if isContentVisible {
+            hiddenSince = nil
+            if let tab = activeTab, tab.isHibernated, tab.hasEverLoaded || tab.url != nil {
+                attachActiveTab()
+                refreshChrome()
+            }
+        } else if hiddenSince == nil {
+            hiddenSince = Date()
+        }
+    }
+
     func windowWillClose(_ notification: Notification) {
+        omnibox.hide()
         saveSessionNow()
         hibernationTimer?.invalidate()
         memoryTimer?.invalidate()
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+        observers.removeAll()
         AppDelegate.shared?.windowClosed(self)
     }
 
@@ -259,33 +357,60 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         if !visible { focusWebContent() }
     }
 
+    @objc private func assistantButtonPressed() {
+        guard Config.shared.agentActive else { showStatus("Assistant is disabled in Settings"); return }
+        toggleAgentSidebar()
+    }
+
+    /// Opens the assistant with a prompt ready to send (context menu, page actions).
+    func askAssistant(_ prompt: String) {
+        guard !isPrivateWindow else { showStatus("Assistant is unavailable in Private windows"); return }
+        guard Config.shared.agentActive else { showStatus("Assistant is disabled in Settings"); return }
+        if !agentSidebarVisible { setAgentSidebarVisible(true) }
+        agentSidebar.prefill(prompt)
+    }
+
     // MARK: - Tabs
 
     @discardableResult
-    func newTab(url: URL? = nil, activate: Bool = true, configuration: WKWebViewConfiguration? = nil) -> Tab {
+    func newTab(url: URL? = nil, activate: Bool = true, configuration: WKWebViewConfiguration? = nil,
+                opener: Tab? = nil) -> Tab {
         let tab = Tab(url: url, isPrivate: isPrivateWindow, delegate: self, configuration: configuration)
-        tabs.append(tab)
+        tab.opener = opener
+        let index = insertionIndex(after: opener)
+        tabs.insert(tab, at: index)
+        // Keep the selection on the same tab, not the same slot.
+        if tabs.count > 1, index <= activeIndex { activeIndex += 1 }
         // An opener-created tab must have its web view before we return it to WebKit.
         if configuration != nil {
             MemoryBudgetController.shared.prepareToActivate(tab)
             tab.ensureLoaded()
         }
         if activate {
-            activeIndex = tabs.count - 1
+            activeIndex = index
             attachActiveTab()
-            if url == nil { focusURLField() }
+            if url == nil && configuration == nil { focusURLField() }
         }
         refreshChrome()
         scheduleSessionSave()
         return tab
     }
 
+    /// Tabs opened from a link go right after their opener (and after its earlier
+    /// children), the way Chrome places them; everything else goes at the end.
+    private func insertionIndex(after opener: Tab?) -> Int {
+        guard let opener, let i = tabs.firstIndex(where: { $0 === opener }) else { return tabs.count }
+        var j = i + 1
+        while j < tabs.count, tabs[j].opener === opener { j += 1 }
+        return max(j, pinnedCount)
+    }
+
     func restore(saved: [SavedTab], activeIndex idx: Int) {
-        for s in saved {
-            let t = Tab(saved: s, delegate: self)
-            tabs.append(t)
-        }
-        activeIndex = min(max(0, idx), max(0, tabs.count - 1))
+        let restored = saved.map { Tab(saved: $0, delegate: self) }
+        let active = restored.indices.contains(idx) ? restored[idx] : restored.first
+        // Pinned tabs always lead the strip.
+        tabs += restored.filter(\.isPinned) + restored.filter { !$0.isPinned }
+        activeIndex = active.flatMap { a in tabs.firstIndex { $0 === a } } ?? 0
         attachActiveTab()
         refreshChrome()
     }
@@ -309,8 +434,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         let tab = tabs[index]
         if tab.url != nil, !isPrivateWindow {
             closedTabs.append(tab.snapshot())
-            if closedTabs.count > 10 { closedTabs.removeFirst() }
+            if closedTabs.count > 25 { closedTabs.removeFirst() }
         }
+        let wasActive = index == activeIndex
         tab.webView?.removeFromSuperview()
         tab.hibernate()
         tabs.remove(at: index)
@@ -319,14 +445,39 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
             window?.close()
             return
         }
-        if activeIndex >= tabs.count { activeIndex = tabs.count - 1 }
-        else if index < activeIndex { activeIndex -= 1 }
+        if wasActive {
+            // Like Chrome: closing the last tab a page opened returns to that page.
+            if let opener = tab.opener, let o = tabs.firstIndex(where: { $0 === opener }),
+               !(tabs.indices.contains(index) && tabs[index].opener === opener) {
+                activeIndex = o
+            } else {
+                activeIndex = min(index, tabs.count - 1)
+            }
+        } else if index < activeIndex {
+            activeIndex -= 1
+        }
         attachActiveTab()
         refreshChrome()
         scheduleSessionSave()
     }
 
     func closeActiveTab() { closeTab(index: activeIndex) }
+
+    private func close(_ victims: [Tab]) {
+        let keep = activeTab
+        for tab in victims {
+            if tab.url != nil, !isPrivateWindow { closedTabs.append(tab.snapshot()) }
+            tab.webView?.removeFromSuperview()
+            tab.hibernate()
+        }
+        if closedTabs.count > 25 { closedTabs.removeFirst(closedTabs.count - 25) }
+        tabs.removeAll { t in victims.contains { $0 === t } }
+        guard !tabs.isEmpty else { saveSessionNow(); window?.close(); return }
+        activeIndex = keep.flatMap { k in tabs.firstIndex { $0 === k } } ?? min(activeIndex, tabs.count - 1)
+        attachActiveTab()
+        refreshChrome()
+        scheduleSessionSave()
+    }
 
     /// Restores the last closed tab with its history and scroll position intact.
     @objc func reopenClosedTab() {
@@ -335,8 +486,59 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
             return
         }
         let tab = Tab(saved: saved, delegate: self)
-        tabs.append(tab)
-        activeIndex = tabs.count - 1
+        let index = tab.isPinned ? pinnedCount : tabs.count
+        tabs.insert(tab, at: index)
+        activeIndex = index
+        attachActiveTab()
+        refreshChrome()
+        scheduleSessionSave()
+    }
+
+    func setPinned(_ pinned: Bool, for tab: Tab) {
+        guard tab.isPinned != pinned, let i = tabs.firstIndex(where: { $0 === tab }) else { return }
+        let active = activeTab
+        tabs.remove(at: i)
+        tab.isPinned = pinned
+        tabs.insert(tab, at: pinnedCount)
+        activeIndex = active.flatMap { a in tabs.firstIndex { $0 === a } } ?? 0
+        refreshChrome()
+        scheduleSessionSave()
+    }
+
+    func duplicate(_ tab: Tab) {
+        guard tab.url != nil, let i = tabs.firstIndex(where: { $0 === tab }) else { return }
+        var saved = tab.snapshot()
+        saved.pinned = false
+        let copy = Tab(saved: saved, delegate: self)
+        let index = max(i + 1, pinnedCount)
+        tabs.insert(copy, at: index)
+        activeIndex = index
+        attachActiveTab()
+        refreshChrome()
+        scheduleSessionSave()
+    }
+
+    /// Hands a live tab to a brand-new window without reloading it.
+    func moveTabToNewWindow(_ tab: Tab) {
+        guard tabs.count > 1, let i = tabs.firstIndex(where: { $0 === tab }), let app = AppDelegate.shared else {
+            showStatus("This is the only tab in the window"); return
+        }
+        let wasActive = i == activeIndex
+        tabs.remove(at: i)
+        tab.webView?.removeFromSuperview()
+        if wasActive { activeIndex = min(i, tabs.count - 1) } else if i < activeIndex { activeIndex -= 1 }
+        attachActiveTab()
+        refreshChrome()
+        scheduleSessionSave()
+        app.makeBrowserWindow(isPrivate: isPrivateWindow).adopt(tab)
+    }
+
+    func adopt(_ tab: Tab) {
+        tab.delegate = self
+        tab.opener = nil
+        let index = tab.isPinned ? pinnedCount : tabs.count
+        tabs.insert(tab, at: index)
+        activeIndex = index
         attachActiveTab()
         refreshChrome()
         scheduleSessionSave()
@@ -345,6 +547,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     /// Swap the visible web view. Waking a hibernated tab happens here.
     private func attachActiveTab() {
         webContainer.subviews.forEach { $0.removeFromSuperview() }
+        linkStatus.text = ""
+        linkStatus.isHidden = true
+        if findVisible { findCount.stringValue = "" }
         guard let tab = activeTab else { return }
         tab.lastActive = Date()
         MemoryBudgetController.shared.prepareToActivate(tab)
@@ -369,6 +574,16 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         window?.makeFirstResponder(urlField)
     }
 
+    /// Loads a URL in the current tab, or a new one when there is none.
+    func open(_ url: URL, inNewTab: Bool = false) {
+        if activeTab == nil || inNewTab { newTab(url: url); return }
+        activeTab?.load(url)
+        attachActiveTab()
+        refreshChrome()
+        focusWebContent()
+        scheduleSessionSave()
+    }
+
     // MARK: - Chrome refresh
 
     func refreshChrome() {
@@ -381,7 +596,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         forwardButton.isEnabled = tab.canGoForward
 
         reloadButton.setSymbol(tab.isLoading ? "xmark" : "arrow.clockwise")
-        reloadButton.toolTip = tab.isLoading ? "Stop loading" : "Reload (\u{2318}R)"
+        reloadButton.toolTip = tab.isLoading ? "Stop loading (\u{2318}.)" : "Reload (\u{2318}R)"
         progressBar.active = tab.isLoading && tab.progress < 1
         progressBar.progress = tab.progress
 
@@ -399,14 +614,29 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         bookmarkButton.isHighlighted2 = bookmarked
         bookmarkButton.isEnabled = tab.url != nil
 
-        let blocking = Config.shared.blockAdsAndTrackers && ContentBlocker.ruleList != nil
+        let blockingOn = Config.shared.blockAdsAndTrackers && ContentBlocker.ruleList != nil
+        let siteExempt = SiteSettings.shared.isBlockingDisabled(for: tab.url)
+        let blocking = blockingOn && !siteExempt
         shieldButton.isHighlighted2 = blocking
         shieldButton.setSymbol(blocking ? "shield.lefthalf.filled" : "shield.slash")
         shieldButton.toolTip = blocking
-            ? "Blocking \(ContentBlocker.ruleCount) ad & tracker rules \u{2014} click to disable"
-            : "Ad & tracker blocking off \u{2014} click to enable"
+            ? "Blocking \(ContentBlocker.ruleCount) ad & tracker rules \u{2014} click for options"
+            : blockingOn ? "Blocking is off for this site \u{2014} click for options"
+            : "Ad & tracker blocking is off \u{2014} click for options"
+        assistantButton.isHighlighted2 = agentSidebarVisible
+        refreshDownloadsButton(layout: false)
 
         window?.title = tab.displayTitle
+    }
+
+    private func refreshDownloadsButton(layout: Bool = true) {
+        let running = Downloads.shared.activeCount > 0
+        downloadsButton.isRunning = running
+        downloadsButton.fraction = Downloads.shared.aggregateFraction
+        downloadsButton.toolTip = running
+            ? "\(Downloads.shared.activeCount) download\(Downloads.shared.activeCount == 1 ? "" : "s") in progress"
+            : "Downloads (\u{2318}\u{21E7}J)"
+        if layout && downloadsButton.isHidden == !Downloads.shared.items.isEmpty { layoutChrome() }
     }
 
     // MARK: - Actions
@@ -420,6 +650,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     }
 
     @objc func reload() { activeTab?.reload() }
+    @objc func hardReload() { activeTab?.hardReload() }
 
     @objc func stopLoading() {
         guard let tab = activeTab, tab.isLoading else { return }
@@ -427,9 +658,59 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         refreshChrome()
     }
 
+    private func historyMenu(back: Bool) -> NSMenu? {
+        guard let tab = activeTab else { return nil }
+        let menu = NSMenu()
+        for item in tab.historyItems(back: back) {
+            let title = (item.title?.isEmpty == false ? item.title! : Store.displayForm(item.url.absoluteString))
+            let entry = ClosureMenuItem(Tab.abbreviate(title, 60)) { [weak tab] in tab?.go(to: item) }
+            entry.image = isPrivateWindow ? nil : FaviconStore.shared.icon(forHost: item.url.host)
+            menu.addItem(entry)
+        }
+        if !menu.items.isEmpty && !isPrivateWindow {
+            menu.addItem(.separator())
+            menu.addItem(ClosureMenuItem("Show All History") { AppDelegate.shared?.showHistory() })
+        }
+        return menu
+    }
+
+    /// The shield's menu: blocking on this site, and blocking everywhere.
+    @objc func showBlockingMenu() {
+        let url = activeTab?.url
+        let everywhere = Config.shared.blockAdsAndTrackers
+        let exempt = SiteSettings.shared.isBlockingDisabled(for: url)
+        let isWeb = url?.scheme == "http" || url?.scheme == "https"
+        let host = isWeb ? SiteSettings.key(for: url) : nil
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        let site = ClosureMenuItem(host.map { "Block Ads on \($0)" } ?? "Block Ads on This Site") {
+            AppDelegate.shared?.setBlocking(enabled: exempt, forSiteOf: url)
+        }
+        site.state = everywhere && !exempt ? .on : .off
+        // Private windows read site settings but never write them.
+        site.isEnabled = everywhere && host != nil && !isPrivateWindow
+        menu.addItem(site)
+        let all = ClosureMenuItem("Block Ads and Trackers Everywhere") { [weak self] in self?.toggleBlocking() }
+        all.state = everywhere ? .on : .off
+        menu.addItem(all)
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: shieldButton.isFlipped ? shieldButton.bounds.maxY + 4 : -4), in: shieldButton)
+    }
+
+    /// Puts a recompiled rule list into every live page, and reloads those on `site`.
+    func contentRulesDidChange(reloadingSiteOf site: URL?) {
+        let key = SiteSettings.key(for: site)
+        for tab in tabs {
+            guard let wv = tab.webView else { continue }
+            ContentBlocker.install(in: wv.configuration.userContentController)
+            if let host = SiteSettings.key(for: tab.url), let key, host == key || host.hasSuffix("." + key) { wv.reload() }
+        }
+        refreshChrome()
+    }
+
     @objc func toggleBlocking() {
         Config.shared.blockAdsAndTrackers.toggle()
         Config.shared.save()
+        if let app = AppDelegate.shared { app.contentBlockingSettingDidChange(); return }
         if Config.shared.blockAdsAndTrackers {
             ContentBlocker.load { [weak self] _ in
                 self?.reloadAllForRuleChange()
@@ -461,24 +742,129 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     }
 
     @objc private func urlFieldCommitted() {
+        omnibox.hide()
         let raw = urlField.stringValue
         guard let url = Config.shared.resolve(input: raw) else { return }
-        if activeTab == nil { newTab(url: url); return }
-        activeTab?.load(url)
-        attachActiveTab()
-        refreshChrome()
-        focusWebContent()
-        scheduleSessionSave()
+        // ⌘Return opens the result in a new tab, as in Chrome.
+        let newTab = NSApp.currentEvent?.modifierFlags.contains(.command) == true
+        open(url, inNewTab: newTab)
     }
 
-    @objc func zoomIn() { adjustZoom(1.1) }
-    @objc func zoomOut() { adjustZoom(1 / 1.1) }
-    @objc func zoomReset() { activeTab?.webView?.pageZoom = 1 }
+    private func revertAddressBar() {
+        omnibox.hide()
+        urlField.stringValue = activeTab?.url.map { Store.displayForm($0.absoluteString) } ?? ""
+        focusWebContent()
+    }
 
-    private func adjustZoom(_ factor: CGFloat) {
+    @objc func zoomIn() { stepZoom(up: true) }
+    @objc func zoomOut() { stepZoom(up: false) }
+
+    @objc func zoomReset() {
+        guard let tab = activeTab, tab.webView != nil else { return }
+        tab.setPageZoom(1)
+        showStatus("Zoom 100%")
+    }
+
+    private func stepZoom(up: Bool) {
+        guard let tab = activeTab, tab.webView != nil else { return }
+        let current = tab.pageZoom
+        let next = up ? Self.zoomSteps.first { $0 > current + 0.001 } : Self.zoomSteps.last { $0 < current - 0.001 }
+        guard let zoom = next else { return }
+        tab.setPageZoom(zoom)
+        showStatus("Zoom \(Int((zoom * 100).rounded()))%")
+    }
+
+    // MARK: - Page commands
+
+    @objc func printPage() {
+        guard let tab = activeTab, let wv = tab.webView, let window else { NSSound.beep(); return }
+        let info = (NSPrintInfo.shared.copy() as? NSPrintInfo) ?? NSPrintInfo()
+        info.horizontalPagination = .fit
+        info.verticalPagination = .automatic
+        info.isHorizontallyCentered = true
+        info.isVerticallyCentered = false
+        let op = wv.printOperation(with: info)
+        op.showsPrintPanel = true
+        op.showsProgressPanel = true
+        op.jobTitle = tab.displayTitle
+        // WKWebView prints blank pages unless its print view has a real frame.
+        op.view?.frame = wv.bounds
+        op.runModal(for: window, delegate: nil, didRun: nil, contextInfo: nil)
+    }
+
+    private func suggestedFilename(_ ext: String) -> String {
+        let base = (activeTab?.displayTitle ?? "Page")
+            .replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+        return String(base.prefix(120)) + "." + ext
+    }
+
+    @objc func savePageAs() {
+        guard let wv = activeTab?.webView, let window else { NSSound.beep(); return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = suggestedFilename("webarchive")
+        panel.allowedContentTypes = [.webArchive]
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let dest = panel.url else { return }
+            wv.createWebArchiveData { result in
+                switch result {
+                case .success(let data):
+                    do { try data.write(to: dest, options: .atomic); self?.showStatus("Saved \(dest.lastPathComponent)") }
+                    catch { self?.showStatus("Couldn\u{2019}t save: \(error.localizedDescription)") }
+                case .failure(let error):
+                    self?.showStatus("Couldn\u{2019}t save: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    @objc func exportPDF() {
+        guard let wv = activeTab?.webView, let window else { NSSound.beep(); return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = suggestedFilename("pdf")
+        panel.allowedContentTypes = [.pdf]
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let dest = panel.url else { return }
+            wv.createPDF(configuration: WKPDFConfiguration()) { result in
+                switch result {
+                case .success(let data):
+                    do { try data.write(to: dest, options: .atomic); self?.showStatus("Exported \(dest.lastPathComponent)") }
+                    catch { self?.showStatus("Couldn\u{2019}t export: \(error.localizedDescription)") }
+                case .failure(let error):
+                    self?.showStatus("Couldn\u{2019}t export: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    /// Opens Web Inspector for the current page (⌥⌘I). WebKit exposes this only as SPI,
+    /// so fall back to the context-menu route when it is unavailable.
+    @objc func showWebInspector() {
+        guard Config.shared.enableDeveloperTools else { showStatus("Turn on developer tools in Settings"); return }
         guard let wv = activeTab?.webView else { return }
-        wv.pageZoom = min(3, max(0.4, wv.pageZoom * factor))
-        showStatus("Zoom \(Int(wv.pageZoom * 100))%")
+        let getter = NSSelectorFromString("_inspector")
+        guard wv.responds(to: getter), let inspector = wv.perform(getter)?.takeUnretainedValue() as? NSObject,
+              inspector.responds(to: NSSelectorFromString("show")) else {
+            showStatus("Right-click the page and choose Inspect Element"); return
+        }
+        inspector.perform(NSSelectorFromString("show"))
+    }
+
+    // MARK: - Downloads
+
+    @objc func toggleDownloadsPopover() {
+        if let popover = downloadsPopover, popover.isShown { popover.performClose(nil); return }
+        guard !Downloads.shared.items.isEmpty else { Downloads.shared.revealFolder(); return }
+        let controller = DownloadsViewController()
+        controller.webViewProvider = { [weak self] in
+            self?.activeTab?.webView ?? self?.tabs.first { !$0.isHibernated }?.webView
+        }
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.contentViewController = controller
+        if downloadsButton.isHidden { layoutChrome() }
+        popover.show(relativeTo: downloadsButton.bounds, of: downloadsButton,
+                     preferredEdge: downloadsButton.isFlipped ? .maxY : .minY)
+        downloadsPopover = popover
     }
 
     // MARK: - Find
@@ -487,26 +873,71 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         findVisible = true
         layoutChrome()
         window?.makeFirstResponder(findField)
+        findField.currentEditor()?.selectAll(nil)
+        if !findField.stringValue.isEmpty { runFind(backwards: false) }
     }
 
     @objc func hideFindBar() {
         findVisible = false
         findCount.stringValue = ""
+        findWork?.cancel()
         layoutChrome()
         focusWebContent()
+    }
+
+    /// ⌘E: search for whatever is selected on the page.
+    @objc func useSelectionForFind() {
+        activeTab?.webView?.evaluateJavaScript("String(getSelection() || '')") { [weak self] result, _ in
+            guard let self, let text = result as? String else { return }
+            let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !clean.isEmpty else { NSSound.beep(); return }
+            self.findField.stringValue = String(clean.prefix(200))
+            self.findVisible = true
+            self.layoutChrome()
+            self.runFind(backwards: false)
+        }
     }
 
     @objc func findNext() { runFind(backwards: false) }
     @objc func findPrevious() { runFind(backwards: true) }
 
+    private func scheduleIncrementalFind() {
+        findWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.runFind(backwards: false) }
+        findWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+    }
+
     private func runFind(backwards: Bool) {
-        guard let wv = activeTab?.webView, !findField.stringValue.isEmpty else { return }
+        guard let wv = activeTab?.webView else { return }
+        let query = findField.stringValue
+        guard !query.isEmpty else { findCount.stringValue = ""; return }
         let cfg = WKFindConfiguration()
         cfg.backwards = backwards
         cfg.caseSensitive = false
         cfg.wraps = true
-        wv.find(findField.stringValue, configuration: cfg) { [weak self] result in
-            self?.findCount.stringValue = result.matchFound ? "" : "Not found"
+        wv.find(query, configuration: cfg) { [weak self, weak wv] result in
+            guard let self, let wv, self.findField.stringValue == query else { return }
+            guard result.matchFound else {
+                self.findCount.textColor = .systemRed
+                self.findCount.stringValue = "No matches"
+                return
+            }
+            self.countMatches(query, in: wv)
+        }
+    }
+
+    /// WebKit's public find API reports only found / not found, so count in the page text.
+    private func countMatches(_ query: String, in wv: WKWebView) {
+        let js = """
+        (() => { const q = \(Tab.jsLiteral(query.lowercased())); const t = (document.body ? document.body.innerText : '').toLowerCase();
+        let n = 0, i = 0; while ((i = t.indexOf(q, i)) !== -1 && n < 1000) { n++; i += q.length; } return n; })()
+        """
+        wv.evaluateJavaScript(js) { [weak self] result, _ in
+            guard let self, self.findField.stringValue == query else { return }
+            let n = max(1, (result as? NSNumber)?.intValue ?? 1)
+            self.findCount.textColor = .secondaryLabelColor
+            self.findCount.stringValue = n >= 1000 ? "1000+ matches" : "\(n) match\(n == 1 ? "" : "es")"
         }
     }
 
@@ -518,13 +949,21 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         hibernationTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             self?.hibernateIdleTabs()
         }
+        hibernationTimer?.tolerance = 5
     }
 
     private func hibernateIdleTabs() {
         let threshold = Config.shared.hibernateAfterMinutes * 60
         var slept = 0
-        for (i, tab) in tabs.enumerated() where i != activeIndex {
-            if tab.canHibernate(idleFor: threshold) { tab.hibernate(); slept += 1 }
+        for (i, tab) in tabs.enumerated() {
+            if i == activeIndex {
+                // The page on screen never sleeps; the one in a window nobody can see may.
+                guard let since = hiddenSince, !isContentVisible,
+                      Date().timeIntervalSince(since) >= threshold, tab.canHibernateForBudget else { continue }
+                tab.hibernate(); slept += 1
+            } else if tab.canHibernate(idleFor: threshold) {
+                tab.hibernate(); slept += 1
+            }
         }
         if slept > 0 {
             refreshChrome()
@@ -554,10 +993,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         }
         updateMemoryReadout()
         memoryTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: true) { [weak self] _ in
-            guard let self, let w = self.window,
-                  w.isVisible, w.occlusionState.contains(.visible) else { return }
+            guard let self, self.isContentVisible else { return }
             self.updateMemoryReadout()
         }
+        memoryTimer?.tolerance = 2
     }
 
     private func updateMemoryReadout() {
@@ -567,7 +1006,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         var text = MemoryBudgetController.shared.budgetDisplay(sample: s)
         if sleeping > 0 { text += " \u{00B7} \(sleeping) asleep" }
         statusPill.text = text
-        let budgetNote = MemoryBudgetController.shared.isEnabled ? " · target \(Config.shared.memoryBudgetMB) MB" : ""
+        let budgetNote = MemoryBudgetController.shared.isEnabled ? " \u{00B7} target \(Config.shared.memoryBudgetMB) MB" : ""
         statusPill.toolTip = "\(s.display) total\(budgetNote) \u{2014} app \(ByteCountFormatter.string(fromByteCount: Int64(s.appBytes), countStyle: .memory)) + \(s.helperCount) web process\(s.helperCount == 1 ? "" : "es")"
         layoutChrome()
     }
@@ -613,15 +1052,73 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
 
     func sessionSnapshot() -> SavedWindow? {
         guard !isPrivateWindow else { return nil }
-        let snapshots = tabs.filter { $0.url != nil }.map { $0.snapshot() }
+        let saved = tabs.filter { $0.url != nil }
+        let snapshots = saved.map { $0.snapshot() }
         guard !snapshots.isEmpty else { return nil }
-        return SavedWindow(tabs: snapshots, activeIndex: min(activeIndex, snapshots.count - 1), frame: window?.frame)
+        let active = activeTab.flatMap { a in saved.firstIndex { $0 === a } } ?? min(activeIndex, snapshots.count - 1)
+        return SavedWindow(tabs: snapshots, activeIndex: active, frame: window?.frame)
     }
 
     func saveSessionNow() {
         guard !isPrivateWindow else { return }
         AppDelegate.shared?.saveApplicationSession()
         Store.shared.flush()
+    }
+
+    // MARK: - Omnibox
+
+    private func omniboxTabs() -> [(id: UUID, title: String, url: URL)] {
+        let windows = (AppDelegate.shared?.allControllers ?? [self]).filter { $0.isPrivateWindow == isPrivateWindow }
+        let current = activeTab
+        return windows.flatMap { w in
+            w.tabs.compactMap { t -> (id: UUID, title: String, url: URL)? in
+                guard t !== current, let url = t.url else { return nil }
+                return (id: t.id, title: t.displayTitle, url: url)
+            }
+        }
+    }
+
+    private func updateOmnibox() {
+        guard let editor = urlField.currentEditor() as? NSTextView else { return }
+        let text = editor.string
+        let length = (text as NSString).length
+        // Backspacing must never re-complete what the user is deleting.
+        let deleting = text.count <= omniboxTypedLength
+        omniboxTypedLength = text.count
+        omniboxTyped = text
+        var completion: String?
+        let selection = editor.selectedRange()
+        if !deleting, selection.location == length, selection.length == 0,
+           let c = Omnibox.inlineCompletion(for: text) {
+            completion = c
+            editor.string = c
+            editor.setSelectedRange(NSRange(location: length, length: (c as NSString).length - length))
+        }
+        let items = Omnibox.suggestions(for: text, completion: completion, openTabs: omniboxTabs())
+        if items.isEmpty { omnibox.hide() } else { omnibox.show(items, below: urlBar) }
+    }
+
+    private func activateSuggestion(at index: Int) {
+        guard omnibox.suggestions.indices.contains(index) else { return }
+        let suggestion = omnibox.suggestions[index]
+        omnibox.hide()
+        if suggestion.kind == .openTab, let id = suggestion.tabID {
+            switchToTab(id: id)
+        } else if let url = suggestion.url {
+            open(url)
+        }
+    }
+
+    /// "Switch to Tab": bring that tab forward, and drop the empty tab it was typed into.
+    private func switchToTab(id: UUID) {
+        let blank = activeTab.flatMap { $0.url == nil && !$0.hasEverLoaded ? $0 : nil }
+        for controller in AppDelegate.shared?.allControllers ?? [self] {
+            guard let i = controller.tabs.firstIndex(where: { $0.id == id }) else { continue }
+            controller.window?.makeKeyAndOrderFront(nil)
+            controller.selectTab(index: i)
+            if let blank, let j = tabs.firstIndex(where: { $0 === blank }) { closeTab(index: j) }
+            return
+        }
     }
 }
 
@@ -639,12 +1136,13 @@ extension BrowserWindowController: TabDelegate {
     }
 
     func tab(_ tab: Tab, openNewTabWith url: URL?, configuration: WKWebViewConfiguration?, activate: Bool) -> Tab? {
-        let previous = activeIndex
-        let newOne = newTab(url: url, activate: true, configuration: configuration)
-        if !activate, tabs.indices.contains(previous) {
-            activeIndex = previous
-            attachActiveTab()
-            refreshChrome()
+        let newOne = newTab(url: url, activate: activate, configuration: configuration, opener: tab)
+        if !activate && configuration == nil {
+            // A background tab from a link starts loading now, so it is ready when clicked.
+            MemoryBudgetController.shared.prepareToActivate(newOne)
+            newOne.lastActive = Date()
+            newOne.ensureLoaded()
+            tabStrip.update(tabs: tabs, selected: activeIndex)
         }
         return newOne
     }
@@ -657,6 +1155,27 @@ extension BrowserWindowController: TabDelegate {
     func tabStatus(_ tab: Tab, message: String?) {
         if let message { showStatus(message) }
     }
+
+    func tab(_ tab: Tab, didHoverLink url: URL?) {
+        guard tab === activeTab else { return }
+        linkStatus.text = url?.absoluteString ?? ""
+        layoutLinkStatus()
+    }
+
+    func tab(_ tab: Tab, openInNewWindow url: URL, isPrivate: Bool) {
+        AppDelegate.shared?.openInNewWindow(url, isPrivate: isPrivate)
+    }
+
+    func tab(_ tab: Tab, askAssistant prompt: String) {
+        askAssistant(prompt)
+    }
+
+    func tabRequestsAttention(_ tab: Tab) {
+        guard let idx = tabs.firstIndex(where: { $0 === tab }), idx != activeIndex else { return }
+        selectTab(index: idx)
+    }
+
+    func presentingWindow(for tab: Tab) -> NSWindow? { window }
 }
 
 extension BrowserWindowController: TabStripDelegate {
@@ -664,18 +1183,22 @@ extension BrowserWindowController: TabStripDelegate {
     func tabStripDidRequestClose(index: Int) { closeTab(index: index) }
     func tabStripDidRequestNewTab() { newTab() }
 
+    func tabStripDidToggleMute(index: Int) {
+        guard tabs.indices.contains(index) else { return }
+        tabs[index].isMuted.toggle()
+    }
+
     func tabStripDidRequestMove(from: Int, to: Int) {
         guard tabs.indices.contains(from), tabs.indices.contains(to), from != to else { return }
-        let moved = tabs.remove(at: from)
+        let moved = tabs[from]
+        let pinned = pinnedCount
+        // Pinned and unpinned tabs each stay in their own section.
+        guard moved.isPinned ? to < pinned : to >= pinned else { return }
+        let active = activeTab
+        tabs.remove(at: from)
         tabs.insert(moved, at: to)
         // Keep the selection on the same tab, not the same slot.
-        if activeIndex == from {
-            activeIndex = to
-        } else if from < activeIndex, to >= activeIndex {
-            activeIndex -= 1
-        } else if from > activeIndex, to <= activeIndex {
-            activeIndex += 1
-        }
+        activeIndex = active.flatMap { a in tabs.firstIndex { $0 === a } } ?? activeIndex
         refreshChrome()
         scheduleSessionSave()
     }
@@ -690,10 +1213,13 @@ extension BrowserWindowController: TabStripDelegate {
         items.append(("Reload", { [weak self] in
             tab.reload(); self?.refreshChrome()
         }))
-        items.append(("Duplicate Tab", { [weak self] in
-            guard let self, let u = tab.url else { return }
-            self.newTab(url: u)
+        if tab.url != nil {
+            items.append(("Duplicate Tab", { [weak self] in self?.duplicate(tab) }))
+        }
+        items.append((tab.isPinned ? "Unpin Tab" : "Pin Tab", { [weak self] in
+            self?.setPinned(!tab.isPinned, for: tab)
         }))
+        items.append((tab.isMuted ? "Unmute Tab" : "Mute Tab", { tab.isMuted.toggle() }))
         if let u = tab.url {
             items.append(("Copy Address", {
                 NSPasteboard.general.clearContents()
@@ -716,6 +1242,10 @@ extension BrowserWindowController: TabStripDelegate {
                 self.refreshChrome()
             }))
         }
+        if tabs.count > 1 {
+            items.append(("-", {}))
+            items.append(("Move Tab to New Window", { [weak self] in self?.moveTabToNewWindow(tab) }))
+        }
         items.append(("-", {}))
         items.append(("Close Tab", { [weak self] in
             guard let self, let i = self.tabs.firstIndex(where: { $0 === tab }) else { return }
@@ -724,16 +1254,15 @@ extension BrowserWindowController: TabStripDelegate {
         if tabs.count > 1 {
             items.append(("Close Other Tabs", { [weak self] in
                 guard let self else { return }
-                for other in self.tabs where other !== tab {
-                    if let u = other.url { self.closedTabs.append(other.snapshot()); _ = u }
-                    other.webView?.removeFromSuperview()
-                    other.hibernate()
-                }
-                self.tabs = [tab]
-                self.activeIndex = 0
-                self.attachActiveTab()
-                self.refreshChrome()
-                self.scheduleSessionSave()
+                // Pinned tabs are kept, as in Chrome.
+                self.close(self.tabs.filter { $0 !== tab && !$0.isPinned })
+                if let i = self.tabs.firstIndex(where: { $0 === tab }) { self.selectTab(index: i) }
+            }))
+        }
+        if index < tabs.count - 1 {
+            items.append(("Close Tabs to the Right", { [weak self] in
+                guard let self, let i = self.tabs.firstIndex(where: { $0 === tab }) else { return }
+                self.close(Array(self.tabs[(i + 1)...]).filter { !$0.isPinned })
             }))
         }
         return items
@@ -742,24 +1271,62 @@ extension BrowserWindowController: TabStripDelegate {
 
 extension BrowserWindowController: NSTextFieldDelegate {
     func controlTextDidBeginEditing(_ obj: Notification) {
-        if (obj.object as? NSTextField) === urlField { urlBar.setFocused(true) }
+        guard (obj.object as? NSTextField) === urlField else { return }
+        urlBar.setFocused(true)
+        omniboxTypedLength = 0
     }
 
     func controlTextDidEndEditing(_ obj: Notification) {
-        if (obj.object as? NSTextField) === urlField { urlBar.setFocused(false) }
+        guard (obj.object as? NSTextField) === urlField else { return }
+        urlBar.setFocused(false)
+        omnibox.hide()
     }
 
     func controlTextDidChange(_ obj: Notification) {
-        guard (obj.object as? NSTextField) === urlField, !suppressCompletion,
-              let editor = urlField.currentEditor() as? NSTextView else { return }
-        suppressCompletion = true
-        editor.complete(nil)
-        suppressCompletion = false
+        guard let field = obj.object as? NSTextField else { return }
+        if field === urlField { updateOmnibox() }
+        else if field === findField { scheduleIncrementalFind() }
     }
 
-    func control(_ control: NSControl, textView: NSTextView, completions words: [String],
-                 forPartialWordRange charRange: NSRange, indexOfSelectedItem index: UnsafeMutablePointer<Int>) -> [String] {
-        index.pointee = -1     // do not auto-insert; let the user arrow down
-        return Store.shared.suggestions(for: textView.string)
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+        if control === findField {
+            switch selector {
+            case #selector(NSResponder.cancelOperation(_:)):
+                hideFindBar(); return true
+            case #selector(NSResponder.insertNewline(_:)):
+                findWork?.cancel()
+                runFind(backwards: NSApp.currentEvent?.modifierFlags.contains(.shift) == true); return true
+            default:
+                return false
+            }
+        }
+        guard control === urlField else { return false }
+        switch selector {
+        case #selector(NSResponder.moveDown(_:)), #selector(NSResponder.moveUp(_:)):
+            guard omnibox.isVisible,
+                  let row = omnibox.move(selector == #selector(NSResponder.moveDown(_:)) ? 1 : -1) else { return false }
+            textView.string = row.fillText
+            textView.setSelectedRange(NSRange(location: (row.fillText as NSString).length, length: 0))
+            return true
+        case #selector(NSResponder.insertNewline(_:)):
+            if omnibox.isVisible, omnibox.selectedIndex > 0 {
+                activateSuggestion(at: omnibox.selectedIndex); return true
+            }
+            omnibox.hide()
+            return false
+        case #selector(NSResponder.cancelOperation(_:)):
+            // First Escape closes the dropdown and restores what was typed; the second
+            // restores the page address and returns focus to the page.
+            if omnibox.isVisible {
+                omnibox.hide()
+                textView.string = omniboxTyped
+                textView.setSelectedRange(NSRange(location: (omniboxTyped as NSString).length, length: 0))
+                return true
+            }
+            revertAddressBar()
+            return true
+        default:
+            return false
+        }
     }
 }

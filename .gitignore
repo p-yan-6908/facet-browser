@@ -1,4 +1,5 @@
-# Build intermediates (the finished bundle is committed; these are not)
+# Build output. Release bundles come from .github/workflows/release.yml.
+Facet.app/
 build/
 *.o
 *.swiftmodule

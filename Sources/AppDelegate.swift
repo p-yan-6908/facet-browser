@@ -1,7 +1,7 @@
 import AppKit
 import WebKit
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemValidation {
     static var shared: AppDelegate?
 
     private var controllers: [BrowserWindowController] = []
@@ -12,6 +12,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let bookmarksMenu = NSMenu(title: "Bookmarks")
     private let historyMenu = NSMenu(title: "History")
     private var settingsWindowController: SettingsWindowController?
+    private var libraryWindowController: LibraryWindowController?
 
     var allControllers: [BrowserWindowController] { controllers }
 
@@ -77,19 +78,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return c
     }
 
+    /// A new, visible browser window (used for Move Tab to New Window and link menus).
+    func makeBrowserWindow(isPrivate: Bool) -> BrowserWindowController {
+        makeWindow(isPrivate: isPrivate)
+    }
+
+    func openInNewWindow(_ url: URL, isPrivate: Bool) {
+        makeWindow(isPrivate: isPrivate).newTab(url: url)
+    }
+
+    /// Opens a URL from outside a browser window (History, Bookmarks), in a normal window.
+    func openInFrontWindow(_ url: URL, activate: Bool) {
+        let target = controllers.last { !$0.isPrivateWindow && $0.window?.isVisible == true } ?? makeWindow()
+        let tab = target.newTab(url: url, activate: activate)
+        if !activate { tab.ensureLoaded() }
+        target.window?.makeKeyAndOrderFront(nil)
+    }
+
     func windowClosed(_ controller: BrowserWindowController) {
         MemoryBudgetController.shared.unregister(controller)
         controllers.removeAll { $0 === controller }
+        // Private browsing data lives exactly as long as some private window does.
+        if controller.isPrivateWindow && !controllers.contains(where: \.isPrivateWindow) {
+            WebKitEnv.discardPrivateStore()
+        }
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         saveApplicationSession()
         Store.shared.flush()
+        SiteSettings.shared.flush()
         return .terminateNow
     }
 
     func saveApplicationSession() {
         let normal = controllers.filter { !$0.isPrivateWindow }
+        // Each window saves itself as it closes. With none left, quitting keeps that last
+        // session to restore, as Chrome and Safari do, instead of overwriting it with nothing.
+        guard !normal.isEmpty else { return }
         let snapshots = normal.compactMap { $0.sessionSnapshot() }
         let selected = front.flatMap { current in normal.firstIndex(where: { $0 === current }) }
         Store.shared.saveSession(windows: snapshots, selectedWindow: selected)
@@ -122,6 +148,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func reopenClosedTab() { front?.reopenClosedTab() }
     @objc func focusAddressBar() { front?.focusURLField() }
     @objc func reload() { front?.reload() }
+    @objc func hardReload() { front?.hardReload() }
+    @objc func printPage() { front?.printPage() }
+    @objc func savePageAs() { front?.savePageAs() }
+    @objc func exportPDF() { front?.exportPDF() }
+    @objc func showWebInspector() { front?.showWebInspector() }
+    @objc func useSelectionForFind() { front?.useSelectionForFind() }
+    @objc func showDownloads() {
+        if let front { front.toggleDownloadsPopover() } else { Downloads.shared.revealFolder() }
+    }
+
+    @objc func toggleBookmarksBar() {
+        Config.shared.showBookmarksBar.toggle()
+        Config.shared.save()
+        controllers.forEach { $0.chromeLayoutDidChange() }
+    }
+
+    @objc func showHistory() { showLibrary(.history) }
+    @objc func showBookmarksManager() { showLibrary(.bookmarks) }
+
+    private func showLibrary(_ mode: LibraryWindowController.Mode) {
+        if libraryWindowController == nil { libraryWindowController = LibraryWindowController() }
+        libraryWindowController?.show(mode)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    // Tab menu: each acts on the front window's current tab.
+    @objc func togglePinTab() {
+        guard let c = front, let tab = c.activeTab else { return }
+        c.setPinned(!tab.isPinned, for: tab)
+    }
+    @objc func toggleMuteTab() { front?.activeTab?.isMuted.toggle() }
+    @objc func duplicateTab() {
+        guard let c = front, let tab = c.activeTab else { return }
+        c.duplicate(tab)
+    }
+    @objc func moveTabToNewWindow() {
+        guard let c = front, let tab = c.activeTab else { return }
+        c.moveTabToNewWindow(tab)
+    }
+
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        let tab = front?.activeTab
+        switch item.action {
+        case #selector(toggleBookmarksBar):
+            item.state = Config.shared.showBookmarksBar ? .on : .off
+        case #selector(togglePinTab):
+            item.title = tab?.isPinned == true ? "Unpin Tab" : "Pin Tab"
+            return tab != nil
+        case #selector(toggleMuteTab):
+            item.title = tab?.isMuted == true ? "Unmute Tab" : "Mute Tab"
+            return tab != nil
+        case #selector(duplicateTab):
+            return tab?.url != nil
+        case #selector(moveTabToNewWindow):
+            return (front?.tabs.count ?? 0) > 1
+        case #selector(printPage), #selector(savePageAs), #selector(exportPDF), #selector(useSelectionForFind):
+            return tab?.webView != nil
+        case #selector(showWebInspector):
+            return tab?.webView != nil && Config.shared.enableDeveloperTools
+        default:
+            break
+        }
+        return true
+    }
     @objc func stopLoading() { front?.stopLoading() }
     @objc func goBack() { front?.goBack() }
     @objc func goForward() { front?.goForward() }
@@ -138,7 +228,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func openDownloadsFolder() { Downloads.shared.revealFolder() }
 
     @objc func showAgent() {
-        guard Config.shared.agentEnabled else { front?.showStatus("Assistant is disabled in Settings"); return }
+        guard Config.shared.agentActive else { front?.showStatus("Assistant is disabled in Settings"); return }
         guard let front else { return }
         front.toggleAgentSidebar()
     }
@@ -178,6 +268,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         else { apply() }
     }
 
+    /// Turns blocking back on, or off, for one site, then reloads that site's pages.
+    func setBlocking(enabled: Bool, forSiteOf url: URL?) {
+        guard let host = SiteSettings.key(for: url) else { return }
+        SiteSettings.shared.setBlockingDisabled(!enabled, for: url)
+        ContentBlocker.load { [weak self] _ in
+            self?.controllers.forEach { $0.contentRulesDidChange(reloadingSiteOf: url) }
+            self?.front?.showStatus(enabled ? "Blocking on for \(host)" : "Blocking off for \(host)")
+        }
+    }
+
     func browserDataWasImported() {
         rebuildBookmarksMenu()
         rebuildHistoryMenu()
@@ -203,6 +303,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Store.shared.clearHistory()
         rebuildHistoryMenu()
         front?.showStatus("History cleared")
+    }
+
+    /// Chrome's Clear Browsing Data: a time range plus what to remove. Bookmarks, saved
+    /// sessions, and private windows are never touched.
+    @objc func clearBrowsingData() {
+        let alert = NSAlert()
+        alert.messageText = "Clear Browsing Data"
+        alert.informativeText = "Bookmarks and open tabs are kept. Private windows are not affected."
+        let box = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 128))
+        let rangeLabel = NSTextField(labelWithString: "Time range:")
+        rangeLabel.frame = NSRect(x: 0, y: 104, width: 80, height: 18)
+        let range = NSPopUpButton(frame: NSRect(x: 82, y: 98, width: 200, height: 26))
+        let ranges: [(String, TimeInterval?)] = [("Last hour", 3_600), ("Last 24 hours", 86_400),
+                                                 ("Last 7 days", 604_800), ("Last 4 weeks", 2_419_200), ("All time", nil)]
+        range.addItems(withTitles: ranges.map(\.0))
+        range.selectItem(at: 1)
+        func check(_ title: String, _ y: CGFloat, on: Bool) -> NSButton {
+            let b = NSButton(checkboxWithTitle: title, target: nil, action: nil)
+            b.frame = NSRect(x: 0, y: y, width: 300, height: 20)
+            b.state = on ? .on : .off
+            return b
+        }
+        let history = check("Browsing history", 72, on: true)
+        let cookies = check("Cookies and other site data (signs you out)", 48, on: true)
+        let cache = check("Cached images and files", 24, on: true)
+        let site = check("Site settings (zoom levels and permissions)", 0, on: false)
+        [rangeLabel, range, history, cookies, cache, site].forEach { box.addSubview($0) }
+        alert.accessoryView = box
+        alert.addButton(withTitle: "Clear Data")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let window = ranges[range.indexOfSelectedItem].1
+        let since = window.map { Date().addingTimeInterval(-$0) } ?? .distantPast
+        if history.state == .on {
+            if window == nil { Store.shared.clearHistory(); FaviconStore.shared.clearAll() }
+            else { Store.shared.clearHistory(since: since) }
+            rebuildHistoryMenu()
+        }
+        if site.state == .on { SiteSettings.shared.resetAll() }
+        let cacheTypes: Set<String> = [WKWebsiteDataTypeDiskCache, WKWebsiteDataTypeMemoryCache,
+                                       WKWebsiteDataTypeOfflineWebApplicationCache, WKWebsiteDataTypeFetchCache]
+        var types = Set<String>()
+        if cookies.state == .on { types.formUnion(WKWebsiteDataStore.allWebsiteDataTypes().subtracting(cacheTypes)) }
+        if cache.state == .on { types.formUnion(cacheTypes); URLCache.shared.removeAllCachedResponses() }
+        guard !types.isEmpty else { front?.showStatus("Browsing data cleared"); return }
+        WKWebsiteDataStore.default().removeData(ofTypes: types, modifiedSince: since) { [weak self] in
+            self?.front?.showStatus("Browsing data cleared")
+        }
     }
 
     @objc func clearWebsiteData() {
@@ -256,6 +405,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let add = NSMenuItem(title: "Bookmark This Page", action: #selector(bookmark), keyEquivalent: "d")
         add.target = self
         bookmarksMenu.addItem(add)
+        let manager = NSMenuItem(title: "Bookmark Manager", action: #selector(showBookmarksManager), keyEquivalent: "b")
+        manager.keyEquivalentModifierMask = [.command, .option]
+        manager.target = self
+        bookmarksMenu.addItem(manager)
+        let bar = NSMenuItem(title: "Always Show Bookmarks Bar", action: #selector(toggleBookmarksBar), keyEquivalent: "")
+        bar.target = self
+        bookmarksMenu.addItem(bar)
         bookmarksMenu.addItem(.separator())
         if Store.shared.bookmarks.isEmpty {
             let empty = NSMenuItem(title: "No Bookmarks", action: nil, keyEquivalent: "")
@@ -282,6 +438,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add("Back", #selector(goBack), "[")
         add("Forward", #selector(goForward), "]")
         historyMenu.addItem(.separator())
+        add("Show All History", #selector(showHistory), "y")
+        add("Reopen Closed Tab", #selector(reopenClosedTab), "t", [.command, .shift])
+        historyMenu.addItem(.separator())
         for e in Store.shared.recentHistory(limit: 15) {
             let title = e.title.isEmpty ? Store.displayForm(e.url) : e.title
             let item = NSMenuItem(title: String(title.prefix(60)), action: #selector(openBookmark(_:)), keyEquivalent: "")
@@ -290,8 +449,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             historyMenu.addItem(item)
         }
         historyMenu.addItem(.separator())
-        add("Clear History\u{2026}", #selector(clearHistory), "")
-        add("Clear Cookies and Cache\u{2026}", #selector(clearWebsiteData), "")
+        add("Clear Browsing Data\u{2026}", #selector(clearBrowsingData), "\u{8}", [.command, .shift])
     }
 
     private func buildMenu() {
@@ -337,10 +495,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add(file, "Import Browser Data\u{2026}", #selector(openImportSettings), target: self)
         file.addItem(.separator())
         add(file, "Close Tab", #selector(closeTab), "w", target: self)
-        add(file, "Reopen Closed Tab", #selector(reopenClosedTab), "t", [.command, .shift], target: self)
         add(file, "Close Window", #selector(NSWindow.performClose(_:)), "w", [.command, .shift])
         file.addItem(.separator())
-        add(file, "Open Downloads Folder", #selector(openDownloadsFolder), "j", [.command, .shift], target: self)
+        add(file, "Save Page As\u{2026}", #selector(savePageAs), "s", target: self)
+        add(file, "Export as PDF\u{2026}", #selector(exportPDF), target: self)
+        add(file, "Print\u{2026}", #selector(printPage), "p", target: self)
+        file.addItem(.separator())
+        add(file, "Downloads", #selector(showDownloads), "j", [.command, .shift], target: self)
+        add(file, "Open Downloads Folder", #selector(openDownloadsFolder), "l", [.command, .option], target: self)
 
         // Edit  (standard responder selectors: required for text editing inside pages)
         let (_, edit) = menu("Edit")
@@ -356,10 +518,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add(edit, "Find\u{2026}", #selector(find), "f", target: self)
         add(edit, "Find Next", #selector(findNext), "g", target: self)
         add(edit, "Find Previous", #selector(findPrevious), "g", [.command, .shift], target: self)
+        add(edit, "Use Selection for Find", #selector(useSelectionForFind), "e", target: self)
 
         // View
         let (_, view) = menu("View")
+        add(view, "Always Show Bookmarks Bar", #selector(toggleBookmarksBar), "b", [.command, .shift], target: self)
+        view.addItem(.separator())
         add(view, "Reload Page", #selector(reload), "r", target: self)
+        add(view, "Force Reload Page", #selector(hardReload), "r", [.command, .shift], target: self)
         add(view, "Stop", #selector(stopLoading), ".", target: self)
         view.addItem(.separator())
         add(view, "Actual Size", #selector(zoomReset), "0", target: self)
@@ -368,7 +534,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         view.addItem(.separator())
         add(view, "Sleep Background Tabs Now", #selector(sleepBackgroundTabs), "h", [.command, .shift], target: self)
         view.addItem(.separator())
-        add(view, "AI Agent\u{2026}", #selector(showAgent), "k", [.command, .shift], target: self)
+        if Config.agentFeatureAvailable {
+            add(view, "AI Agent\u{2026}", #selector(showAgent), "k", [.command, .shift], target: self)
+        }
+        add(view, "Web Inspector", #selector(showWebInspector), "i", [.command, .option], target: self)
         view.addItem(.separator())
         add(view, "Enter Full Screen", #selector(NSWindow.toggleFullScreen(_:)), "f", [.command, .control])
 
@@ -382,6 +551,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let (bmItem, _) = menu("Bookmarks")
         bmItem.submenu = bookmarksMenu
 
+        // Tab
+        let (_, tabMenu) = menu("Tab")
+        add(tabMenu, "New Tab", #selector(newTab), target: self)
+        add(tabMenu, "Duplicate Tab", #selector(duplicateTab), target: self)
+        add(tabMenu, "Pin Tab", #selector(togglePinTab), target: self)
+        add(tabMenu, "Mute Tab", #selector(toggleMuteTab), target: self)
+        add(tabMenu, "Move Tab to New Window", #selector(moveTabToNewWindow), target: self)
+        tabMenu.addItem(.separator())
+        add(tabMenu, "Sleep Background Tabs Now", #selector(sleepBackgroundTabs), target: self)
+
         // Window
         let (windowItem, windowMenu) = menu("Window")
         add(windowMenu, "Minimize", #selector(NSWindow.performMiniaturize(_:)), "m")
@@ -389,9 +568,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         windowMenu.addItem(.separator())
         add(windowMenu, "Show Next Tab", #selector(nextTab), "\u{0009}", [.control], target: self)
         add(windowMenu, "Show Previous Tab", #selector(previousTab), "\u{0009}", [.control, .shift], target: self)
-        // Arrow variants: the shortcut most people reach for first.
-        add(windowMenu, "Next Tab (arrow)", #selector(nextTab), "\u{F703}", [.command, .option], target: self)
-        add(windowMenu, "Previous Tab (arrow)", #selector(previousTab), "\u{F702}", [.command, .option], target: self)
+        // Arrow variants: the shortcut most people reach for first. Hidden, so the menu lists
+        // each command once, but their key equivalents still work.
+        add(windowMenu, "Show Next Tab", #selector(nextTab), "\u{F703}", [.command, .option], target: self)
+        add(windowMenu, "Show Previous Tab", #selector(previousTab), "\u{F702}", [.command, .option], target: self)
+        for item in windowMenu.items.suffix(2) { item.isHidden = true; item.allowsKeyEquivalentWhenHidden = true }
         windowMenu.addItem(.separator())
         for n in 1...9 {
             add(windowMenu, "Tab \(n)", #selector(selectTabByNumber(_:)), "\(n)", target: self, tag: n - 1)
