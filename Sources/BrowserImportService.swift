@@ -176,7 +176,7 @@ final class BrowserImportService {
                     completion: @escaping (Result<BrowserImportResult, Error>) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                var bookmarkEntries: [HistoryEntry] = [], historyEntries: [HistoryEntry] = []
+                var bookmarkEntries: [ImportedBookmark] = [], historyEntries: [HistoryEntry] = []
                 var warnings: [String] = []
                 if bookmarks || history {
                     do { (bookmarkEntries, historyEntries, warnings) = try self.readData(from: source, bookmarks: bookmarks, history: history) }
@@ -218,9 +218,9 @@ final class BrowserImportService {
 
     /// Parsing is separate from persistence so failures never masquerade as successful imports.
     func readData(from source: BrowserImportSource, bookmarks: Bool, history: Bool) throws
-        -> ([HistoryEntry], [HistoryEntry], [String]) {
+        -> ([ImportedBookmark], [HistoryEntry], [String]) {
         var warnings: [String] = []
-        var bookmarkEntries: [HistoryEntry] = []
+        var bookmarkEntries: [ImportedBookmark] = []
         var historyEntries: [HistoryEntry] = []
         if bookmarks {
             if source.hasBookmarks {
@@ -243,7 +243,7 @@ final class BrowserImportService {
 
     // MARK: - Bookmarks
 
-    private func readBookmarks(_ source: BrowserImportSource) throws -> [HistoryEntry] {
+    private func readBookmarks(_ source: BrowserImportSource) throws -> [ImportedBookmark] {
         switch source.format {
         case .chromium: return try readChromiumBookmarks(source.bookmarksURL)
         case .firefox: return try readFirefoxBookmarks(source.bookmarksURL)
@@ -251,38 +251,92 @@ final class BrowserImportService {
         }
     }
 
-    private func readChromiumBookmarks(_ url: URL?) throws -> [HistoryEntry] {
+    private static func isWeb(_ url: String) -> Bool {
+        ["http", "https"].contains(URL(string: url)?.scheme?.lowercased() ?? "")
+    }
+
+    /// Chromium roots: the bar's contents go to Facet's bar, "Other bookmarks" to Other
+    /// Bookmarks, and phone bookmarks to a Mobile Bookmarks folder there. Folders keep their names.
+    private func readChromiumBookmarks(_ url: URL?) throws -> [ImportedBookmark] {
         guard let url else { return [] }
         let data: Data
         do { data = try Data(contentsOf: url) }
         catch { throw BrowserImportError.unreadable("Could not read bookmarks from \(url.path): \(error.localizedDescription)") }
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let roots = root["roots"] as? [String: Any] else { throw BrowserImportError.invalidFormat("Unrecognized Chromium bookmark format.") }
-        var result: [HistoryEntry] = []
-        func walk(_ any: Any) {
+        var result: [ImportedBookmark] = []
+        func walk(_ any: Any, root: ImportedBookmark.Root, folders: [String], isRoot: Bool) {
             guard let node = any as? [String: Any] else { return }
-            if let u = node["url"] as? String, let parsed = URL(string: u), ["http", "https"].contains(parsed.scheme?.lowercased() ?? "") {
-                result.append(HistoryEntry(url: u, title: node["name"] as? String ?? "", visits: 1, lastVisit: Date()))
+            let name = node["name"] as? String ?? ""
+            if let u = node["url"] as? String, Self.isWeb(u) {
+                // Chrome stores microseconds since 1601 as a string.
+                let micros = Double(node["date_added"] as? String ?? "") ?? 0
+                let added = micros > 0 ? Date(timeIntervalSince1970: micros / 1_000_000 - 11_644_473_600) : Date()
+                result.append(ImportedBookmark(url: u, title: name, added: added, root: root, folders: folders))
             }
-            if let children = node["children"] as? [Any] { children.forEach(walk) }
+            guard let children = node["children"] as? [Any] else { return }
+            let inside = isRoot ? folders : folders + [name.isEmpty ? "Untitled Folder" : name]
+            children.forEach { walk($0, root: root, folders: inside, isRoot: false) }
         }
-        roots.values.forEach(walk)
+        let order = ["bookmark_bar", "other", "synced"] + roots.keys.sorted().filter { !["bookmark_bar", "other", "synced"].contains($0) }
+        for key in order {
+            guard let value = roots[key] else { continue }
+            walk(value, root: key == "bookmark_bar" ? .bar : .other, folders: key == "synced" ? ["Mobile Bookmarks"] : [], isRoot: true)
+        }
         return dedupe(result)
     }
 
-    private func readFirefoxBookmarks(_ url: URL?) throws -> [HistoryEntry] {
+    /// Firefox keeps folders as rows whose `parent` chains up to fixed roots: the toolbar
+    /// becomes the bar, the menu and unfiled bookmarks go to Other Bookmarks, and mobile
+    /// bookmarks to a Mobile Bookmarks folder there.
+    private func readFirefoxBookmarks(_ url: URL?) throws -> [ImportedBookmark] {
         guard let url else { return [] }
+        let treeSQL = "SELECT b.id AS id, b.parent AS parent, b.type AS type, COALESCE(b.guid,'') AS guid, COALESCE(NULLIF(b.title,''),NULLIF(p.title,''),'') AS title, p.url AS url, COALESCE(b.dateAdded,0) AS added FROM moz_bookmarks b LEFT JOIN moz_places p ON b.fk=p.id ORDER BY b.parent, b.position;"
+        guard let rows = try? querySQLite(url, sql: treeSQL) else { return try readFirefoxBookmarksFlat(url) }
+        var folders: [Int: (parent: Int, title: String, guid: String)] = [:]
+        for row in rows where Int(number(row["type"])) == 2 {
+            folders[Int(number(row["id"]))] = (Int(number(row["parent"])), row["title"] as? String ?? "", row["guid"] as? String ?? "")
+        }
+        func place(_ parent: Int) -> (ImportedBookmark.Root, [String])? {
+            var path: [String] = [], id = parent
+            for _ in 0..<64 {
+                guard let f = folders[id] else { return nil }
+                switch f.guid {
+                case "toolbar_____": return (.bar, path)
+                case "menu________", "unfiled_____": return (.other, path)
+                case "mobile______": return (.other, ["Mobile Bookmarks"] + path)
+                case "root________", "tags________": return nil
+                default: path.insert(f.title.isEmpty ? "Untitled Folder" : f.title, at: 0); id = f.parent
+                }
+            }
+            return nil
+        }
+        var result: [ImportedBookmark] = []
+        for row in rows where Int(number(row["type"])) == 1 {
+            guard let u = row["url"] as? String, Self.isWeb(u), let (root, path) = place(Int(number(row["parent"]))) else { continue }
+            let micros = number(row["added"])
+            result.append(ImportedBookmark(url: u, title: row["title"] as? String ?? "",
+                                           added: micros > 0 ? Date(timeIntervalSince1970: micros / 1_000_000) : Date(),
+                                           root: root, folders: path))
+        }
+        return dedupe(result)
+    }
+
+    /// Older or partial places databases without folder columns: everything to Other Bookmarks.
+    private func readFirefoxBookmarksFlat(_ url: URL) throws -> [ImportedBookmark] {
         let sql = "SELECT p.url AS url, COALESCE(NULLIF(b.title,''),NULLIF(p.title,''),'') AS title, COALESCE(b.dateAdded,0) AS added FROM moz_bookmarks b JOIN moz_places p ON b.fk=p.id WHERE b.type=1 AND (p.url LIKE 'http://%' OR p.url LIKE 'https://%') ORDER BY b.dateAdded DESC;"
         let rows = try querySQLite(url, sql: sql)
         return dedupe(rows.compactMap { row in
             guard let u = row["url"] as? String else { return nil }
             let micros = number(row["added"])
-            let date = micros > 0 ? Date(timeIntervalSince1970: micros / 1_000_000) : Date()
-            return HistoryEntry(url: u, title: row["title"] as? String ?? "", visits: 1, lastVisit: date)
+            return ImportedBookmark(url: u, title: row["title"] as? String ?? "",
+                                    added: micros > 0 ? Date(timeIntervalSince1970: micros / 1_000_000) : Date())
         })
     }
 
-    private func readSafariBookmarks(_ url: URL?) throws -> [HistoryEntry] {
+    /// Safari's top-level lists: Favorites ("BookmarksBar") become the bar, the Bookmarks menu
+    /// goes to Other Bookmarks, and the Reading List to a folder there.
+    private func readSafariBookmarks(_ url: URL?) throws -> [ImportedBookmark] {
         guard let url else { return [] }
         let data: Data
         do { data = try Data(contentsOf: url) }
@@ -291,17 +345,36 @@ final class BrowserImportService {
         }
         var format = PropertyListSerialization.PropertyListFormat.binary
         let obj = try PropertyListSerialization.propertyList(from: data, options: [], format: &format)
-        var result: [HistoryEntry] = []
-        func walk(_ any: Any) {
+        var result: [ImportedBookmark] = []
+        func walk(_ any: Any, root: ImportedBookmark.Root, folders: [String], depth: Int) {
             guard let d = any as? [String: Any] else { return }
-            if let u = d["URLString"] as? String, let parsed = URL(string: u), ["http", "https"].contains(parsed.scheme?.lowercased() ?? "") {
+            if let u = d["URLString"] as? String, Self.isWeb(u) {
                 let uri = d["URIDictionary"] as? [String: Any]
-                result.append(HistoryEntry(url: u, title: uri?["title"] as? String ?? "", visits: 1, lastVisit: Date()))
+                result.append(ImportedBookmark(url: u, title: uri?["title"] as? String ?? "", root: root, folders: folders))
             }
-            if let children = d["Children"] as? [Any] { children.forEach(walk) }
+            guard let children = d["Children"] as? [Any] else { return }
+            let title = d["Title"] as? String ?? ""
+            var r = root, inside = folders
+            if depth == 1 {
+                switch title {
+                case "BookmarksBar": r = .bar; inside = []
+                case "BookmarksMenu": r = .other; inside = []
+                case "com.apple.ReadingList": r = .other; inside = ["Reading List"]
+                default: r = .other; inside = [title.isEmpty ? "Untitled Folder" : title]
+                }
+            } else if depth > 1 {
+                inside = folders + [title.isEmpty ? "Untitled Folder" : title]
+            }
+            children.forEach { walk($0, root: r, folders: inside, depth: depth + 1) }
         }
-        walk(obj)
+        walk(obj, root: .other, folders: [], depth: 0)
         return dedupe(result)
+    }
+
+    /// The same page bookmarked twice keeps its first place.
+    private func dedupe(_ entries: [ImportedBookmark]) -> [ImportedBookmark] {
+        var seen = Set<String>()
+        return entries.filter { seen.insert($0.url).inserted }
     }
 
     // MARK: - History

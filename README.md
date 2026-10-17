@@ -223,8 +223,16 @@ The things people reach for in Chrome, done natively and without extra processes
   certificate, the permissions you gave the site (set each to Allow, Block or Ask), ad
   blocking for that site, its zoom, and **Clear Cookies and Site Data** for that site alone.
 - **Finding things.** Find as you type, with a match count. ⌘E finds the current selection.
-  History (⌘Y) and Bookmarks (⌥⌘B) open in a native, searchable window where you can delete
-  entries and rename bookmarks. A bookmarks bar (⌘⇧B) has an overflow menu.
+  History (⌘Y) and Bookmarks (⌥⌘B) open in a native, searchable window.
+- **Bookmarks with folders, like Chrome's.** A Bookmarks Bar and Other Bookmarks, with any
+  folders inside. ⌘D or the star bookmarks the page at once and shows a bubble to rename it,
+  choose its folder (or make a new one), or remove it; the next bookmark goes to the folder
+  you chose last. ⌘⇧D saves every tab in the window as a new folder. The bar (⌘⇧B) shows
+  folders as menus, with **Open All**, and a » menu for what does not fit. The Bookmark
+  Manager shows the tree: drag to reorder or move between folders, drag a link in from a
+  page, rename in place, New Folder, Delete, and search. Open All opens the first page and
+  leaves the rest as sleeping tabs that use no memory until you click them. Folder menus are
+  built only when opened, so a large imported collection costs almost nothing.
 - **Per-site memory.** Zoom uses Chrome's steps and is remembered per site. Camera and
   microphone decisions can be remembered per site. Pages that try to open another app
   (`zoommtg:`, `mailto:`, ...) ask first, with an "always allow" option.
@@ -293,7 +301,8 @@ To make it your default browser: **Facet → Make Facet the Default Browser**.
 | `⌘[` / `⌘]` | back / forward (or two-finger swipe; hold the button for history) |
 | `⌘R` / `⌘⇧R` / `⌘.` | reload / reload bypassing the cache / stop |
 | `⌘F` / `⌘G` / `⌘⇧G` / `⌘E` | find as you type, next, previous, find the selection |
-| `⌘D` / `⌘⇧B` / `⌥⌘B` | bookmark / bookmarks bar / bookmark manager |
+| `⌘D` / `⌘⇧D` | bookmark this page (then name it and pick a folder) / bookmark all tabs as a folder |
+| `⌘⇧B` / `⌥⌘B` | bookmarks bar / bookmark manager |
 | `⌘Y` | history |
 | `⌘⇧⌫` | clear browsing data |
 | `⌘+` / `⌘-` / `⌘0` | zoom (remembered per site) |
@@ -332,9 +341,11 @@ for advanced/manual editing, while API keys stay in memory and OAuth tokens stay
 **Settings → Import** detects profiles from Chrome, Brave, Edge, Chromium, Arc, Vivaldi,
 Aside, Opera, Firefox and Safari, then lets you import **bookmarks**, **history**, or both.
 Chromium-family profiles are discovered individually (including Default/Profile 1/etc.),
-and there is a manual profile-folder picker for other Chromium-based browsers. Imports
-are merged by URL, so repeating an import does not duplicate bookmarks or inflate visit
-counts. History uses short-lived read-only SQLite queries, including committed WAL records,
+and there is a manual profile-folder picker for other Chromium-based browsers. Bookmarks
+keep their folders: the source's bookmarks bar (Safari's Favorites, Firefox's toolbar) goes
+to Facet's bar, everything else to Other Bookmarks, with mobile bookmarks and Safari's
+Reading List in folders of their own. Imports are merged by URL and folders by name, so
+repeating an import does not duplicate bookmarks or folders, or inflate visit counts. History uses short-lived read-only SQLite queries, including committed WAL records,
 so recent visits are not lost just because the source browser is still open. No temporary
 copy of your history is written. If a database is locked or inaccessible, close the source
 browser and retry. Partial imports identify the failed category; fully failed imports are
@@ -398,7 +409,7 @@ uses a loopback-only test site and a nonpersistent WebKit store. See
 
 Same folder holds `blocked-domains.txt` (one domain per line, `#` comments — add
 your own and restart; hosts-file lines such as `0.0.0.0 ads.example.com` work too, so a
-published hosts list can be pasted in), `history.json`, `bookmarks.json`, `session.json`,
+published hosts list can be pasted in), `history.json`, `bookmarks.json` (a tree of folders; the older flat format is migrated), `session.json`,
 `site-settings.json` (per-site zoom, remembered permissions and sites with blocking off) and
 `Favicons/` (32px PNGs). All plain files; nothing is a database. Set `FACET_PROFILE_DIR` to run Facet against
 a throwaway profile folder instead.
@@ -427,7 +438,9 @@ a throwaway profile folder instead.
 | `Sources/Omnibox.swift` | address-bar ranking, inline completion, dropdown |
 | `Sources/WebView.swift` | isolated-world page bridge, context-menu hook, closure menu items |
 | `Sources/Downloads.swift` / `DownloadsView.swift` | download tracking, quarantine, toolbar popover |
-| `Sources/BookmarksBar.swift` | bookmarks bar |
+| `Sources/BookmarksBar.swift` | bookmarks bar, folder menus, shared bookmark prompts |
+| `Sources/BookmarkEditor.swift` | the ⌘D bubble: name, folder, remove |
+| `Sources/BookmarkManager.swift` | the bookmark manager's folder tree, drag and drop |
 | `Sources/LibraryWindowController.swift` | native History and Bookmarks window |
 | `Sources/TaskManagerWindowController.swift` | per-tab memory, Sleep and Close |
 | `Sources/TabSearch.swift` | ⌘⇧A tab search across windows |

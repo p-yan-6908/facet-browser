@@ -11,6 +11,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private(set) var isTerminating = false
     private var pendingURLs: [URL] = []
     private let bookmarksMenu = NSMenu(title: "Bookmarks")
+    /// Rebuilt when it next opens after bookmarks change, not on every change.
+    private var bookmarksMenuIsStale = true
+    private var bookmarksObserver: NSObjectProtocol?
     private let historyMenu = NSMenu(title: "History")
     private var fileMenu: NSMenu?
     private var sharePicker: NSSharingServicePicker?
@@ -337,6 +340,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         (front ?? makeWindow()).newTab(url: u)
     }
 
+    /// Open All: the first bookmark in front, the rest as sleeping tabs that cost nothing until
+    /// they are clicked. Capped, so a huge imported folder cannot open thousands of tabs.
+    func openBookmarks(in folder: BookmarkNode, newWindow: Bool) {
+        let urls = folder.allBookmarks.compactMap { $0.url.flatMap(URL.init(string:)) }.prefix(100)
+        guard !urls.isEmpty else { return }
+        let target = newWindow ? makeWindow() : (front ?? makeWindow())
+        for (i, url) in urls.enumerated() { _ = target.newTab(url: url, activate: i == 0) }
+        target.window?.makeKeyAndOrderFront(nil)
+    }
+
+    /// ⌘⇧D: every web page in the front window, saved as one new folder.
+    @objc func bookmarkAllTabs() {
+        guard let c = front else { return }
+        let pages = c.tabs.compactMap { t -> (url: URL, title: String)? in
+            guard let u = t.url, ["http", "https"].contains(u.scheme?.lowercased() ?? "") else { return nil }
+            return (u, t.displayTitle)
+        }
+        guard !pages.isEmpty else { c.showStatus("No pages to bookmark"); return }
+        let parent = Store.shared.lastUsedFolder
+        guard let name = BookmarkActions.prompt(title: "Bookmark All Tabs", message: "Save \(pages.count) tab\(pages.count == 1 ? "" : "s") as a new folder in \(parent.title).",
+                                                value: "Saved Tabs", button: "Save") else { return }
+        let folder = Store.shared.addFolder(title: name, in: parent, pages: pages)
+        c.showStatus("Bookmarked \(pages.count) tab\(pages.count == 1 ? "" : "s") in \(folder.title)")
+    }
+
     @objc func clearHistory() {
         let a = NSAlert()
         a.messageText = "Clear browsing history?"
@@ -447,10 +475,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     // MARK: - Menu construction
 
     func rebuildBookmarksMenu() {
+        bookmarksMenuIsStale = false
         bookmarksMenu.removeAllItems()
-        let add = NSMenuItem(title: "Bookmark This Page", action: #selector(bookmark), keyEquivalent: "d")
+        let add = NSMenuItem(title: "Bookmark This Page\u{2026}", action: #selector(bookmark), keyEquivalent: "d")
         add.target = self
         bookmarksMenu.addItem(add)
+        let all = NSMenuItem(title: "Bookmark All Tabs\u{2026}", action: #selector(bookmarkAllTabs), keyEquivalent: "d")
+        all.keyEquivalentModifierMask = [.command, .shift]
+        all.target = self
+        bookmarksMenu.addItem(all)
         let manager = NSMenuItem(title: "Bookmark Manager", action: #selector(showBookmarksManager), keyEquivalent: "b")
         manager.keyEquivalentModifierMask = [.command, .option]
         manager.target = self
@@ -459,17 +492,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         bar.target = self
         bookmarksMenu.addItem(bar)
         bookmarksMenu.addItem(.separator())
-        if Store.shared.bookmarks.isEmpty {
+        let store = Store.shared
+        if store.bookmarks.isEmpty {
             let empty = NSMenuItem(title: "No Bookmarks", action: nil, keyEquivalent: "")
             empty.isEnabled = false
             bookmarksMenu.addItem(empty)
         }
-        for b in Store.shared.bookmarks {
-            let title = b.title.isEmpty ? Store.displayForm(b.url) : b.title
-            let item = NSMenuItem(title: String(title.prefix(60)), action: #selector(openBookmark(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = b.url
-            bookmarksMenu.addItem(item)
+        // The bar's contents inline, then Other Bookmarks as a submenu, as in Chrome.
+        let open: (URL) -> Void = { [weak self] url in guard let self else { return }; (self.front ?? self.makeWindow()).newTab(url: url) }
+        let openAll: (BookmarkNode) -> Void = { [weak self] folder in self?.openBookmarks(in: folder, newWindow: false) }
+        BookmarkFolderMenu.fill(bookmarksMenu, with: store.bookmarkBar.children, open: open, openAll: openAll)
+        if !store.otherBookmarks.children.isEmpty {
+            bookmarksMenu.addItem(.separator())
+            let other = NSMenuItem(title: store.otherBookmarks.title, action: nil, keyEquivalent: "")
+            other.image = BookmarkFolderMenu.folderIcon
+            other.submenu = BookmarkFolderMenu(folder: store.otherBookmarks, open: open, openAll: openAll)
+            bookmarksMenu.addItem(other)
         }
     }
 
@@ -645,6 +683,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         // Bookmarks
         let (bmItem, _) = menu("Bookmarks")
         bmItem.submenu = bookmarksMenu
+        bookmarksMenu.delegate = self
+        bookmarksObserver = NotificationCenter.default.addObserver(forName: .facetBookmarksChanged, object: nil, queue: .main) { [weak self] _ in
+            self?.bookmarksMenuIsStale = true
+        }
 
         // Tab
         let (_, tabMenu) = menu("Tab")
@@ -687,6 +729,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     func menuNeedsUpdate(_ menu: NSMenu) {
         if menu === historyMenu { rebuildHistoryMenu() }
         if menu === fileMenu { refreshShareItem(in: menu) }
+        if menu === bookmarksMenu, bookmarksMenuIsStale { rebuildBookmarksMenu() }
     }
 
     /// File → Share is rebuilt as the menu opens, for whatever page is in front.

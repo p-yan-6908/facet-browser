@@ -8,6 +8,55 @@ struct HistoryEntry {
     var lastVisit: Date
 }
 
+/// A bookmark, or a folder of them. Folders have no URL.
+final class BookmarkNode {
+    let id: UUID
+    var title: String
+    var url: String?
+    var added: Date
+    fileprivate(set) var children: [BookmarkNode] = []
+    fileprivate(set) weak var parent: BookmarkNode?
+
+    var isFolder: Bool { url == nil }
+
+    init(id: UUID = UUID(), title: String, url: String? = nil, added: Date = Date()) {
+        self.id = id
+        self.title = title
+        self.url = url
+        self.added = added
+    }
+
+    /// True when `other` is this node or anywhere inside it.
+    func contains(_ other: BookmarkNode) -> Bool {
+        var node: BookmarkNode? = other
+        while let n = node { if n === self { return true }; node = n.parent }
+        return false
+    }
+
+    /// The bookmarks in this folder and its subfolders, in order.
+    var allBookmarks: [BookmarkNode] { isFolder ? children.flatMap(\.allBookmarks) : [self] }
+
+    fileprivate func insert(_ child: BookmarkNode, at index: Int?) {
+        child.parent = self
+        children.insert(child, at: min(max(0, index ?? children.count), children.count))
+    }
+
+    fileprivate func removeChild(_ child: BookmarkNode) {
+        children.removeAll { $0 === child }
+        child.parent = nil
+    }
+}
+
+/// One bookmark read from another browser, with the folders it sat in.
+struct ImportedBookmark {
+    enum Root { case bar, other }
+    var url: String
+    var title: String
+    var added: Date = Date()
+    var root: Root = .other
+    var folders: [String] = []
+}
+
 struct SavedTab {
     var url: String
     var title: String
@@ -33,7 +82,6 @@ final class Store {
     static let shared = Store()
 
     private(set) var history: [HistoryEntry] = []
-    private(set) var bookmarks: [HistoryEntry] = []
     private var historyIndex: [String: Int] = [:]
     private let maxHistory = 4000
 
@@ -46,8 +94,8 @@ final class Store {
 
     private init() {
         history = Store.readEntries(historyURL)
-        bookmarks = Store.readEntries(bookmarksURL)
         reindex()
+        loadBookmarks()
         saveTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
             self?.flush()
         }
@@ -203,71 +251,204 @@ final class Store {
 
     // MARK: - Bookmarks
 
-    func isBookmarked(_ url: URL) -> Bool {
-        bookmarks.contains { $0.url == url.absoluteString }
+    /// Chrome's two top-level folders. Neither can be renamed, moved or deleted.
+    let bookmarkBar = BookmarkNode(id: UUID(uuidString: "00000000-0000-0000-0000-00000000B0B0")!, title: "Bookmarks Bar")
+    let otherBookmarks = BookmarkNode(id: UUID(uuidString: "00000000-0000-0000-0000-0000000000AB")!, title: "Other Bookmarks")
+    var bookmarkRoots: [BookmarkNode] { [bookmarkBar, otherBookmarks] }
+
+    /// Every bookmark in tree order, flattened for the omnibox and the History-style lists.
+    private(set) var bookmarks: [HistoryEntry] = []
+    private var bookmarkNodes: [String: [BookmarkNode]] = [:]
+    private var lastFolderID: UUID?
+
+    /// Where ⌘D puts a new bookmark: the folder last chosen in the bookmark bubble, as in Chrome.
+    var lastUsedFolder: BookmarkNode {
+        get { lastFolderID.flatMap(bookmarkNode(withID:)).flatMap { $0.isFolder ? $0 : nil } ?? bookmarkBar }
+        set { lastFolderID = newValue.id; saveBookmarks() }
     }
 
-    func toggleBookmark(url: URL, title: String) -> Bool {
-        if let i = bookmarks.firstIndex(where: { $0.url == url.absoluteString }) {
-            bookmarks.remove(at: i)
-            saveBookmarks()
-            return false
+    func isRoot(_ node: BookmarkNode) -> Bool { node === bookmarkBar || node === otherBookmarks }
+
+    func isBookmarked(_ url: URL) -> Bool { bookmarkNodes[url.absoluteString] != nil }
+
+    func bookmark(for url: URL) -> BookmarkNode? { bookmarkNodes[url.absoluteString]?.first }
+
+    func bookmarkNode(withID id: UUID) -> BookmarkNode? {
+        func find(_ n: BookmarkNode) -> BookmarkNode? { n.id == id ? n : n.children.lazy.compactMap(find).first }
+        return bookmarkRoots.lazy.compactMap(find).first
+    }
+
+    /// Every folder depth first, with its depth, for folder pickers.
+    var bookmarkFolders: [(folder: BookmarkNode, depth: Int)] {
+        func walk(_ n: BookmarkNode, _ depth: Int) -> [(folder: BookmarkNode, depth: Int)] {
+            [(n, depth)] + n.children.filter(\.isFolder).flatMap { walk($0, depth + 1) }
         }
-        bookmarks.append(HistoryEntry(url: url.absoluteString, title: title.isEmpty ? url.host ?? "" : title,
-                                      visits: 1, lastVisit: Date()))
+        return bookmarkRoots.flatMap { walk($0, 0) }
+    }
+
+    @discardableResult
+    func addBookmark(url: URL, title: String, in folder: BookmarkNode? = nil, at index: Int? = nil) -> BookmarkNode {
+        let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let node = BookmarkNode(title: clean.isEmpty ? (url.host ?? url.absoluteString) : clean, url: url.absoluteString)
+        (folder.flatMap { $0.isFolder ? $0 : nil } ?? lastUsedFolder).insert(node, at: index)
+        saveBookmarks()
+        return node
+    }
+
+    /// A new folder, optionally filled with pages (Bookmark All Tabs) in one save.
+    @discardableResult
+    func addFolder(title: String, in folder: BookmarkNode, at index: Int? = nil,
+                   pages: [(url: URL, title: String)] = []) -> BookmarkNode {
+        let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let node = BookmarkNode(title: clean.isEmpty ? "New Folder" : clean)
+        for page in pages {
+            let t = page.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            node.insert(BookmarkNode(title: t.isEmpty ? (page.url.host ?? page.url.absoluteString) : t, url: page.url.absoluteString), at: nil)
+        }
+        (folder.isFolder ? folder : folder.parent ?? bookmarkBar).insert(node, at: index)
+        saveBookmarks()
+        return node
+    }
+
+    /// Moves `node` into `folder` before the child now at `index` (the end when nil). Refuses
+    /// to move a top-level folder or to put a folder inside itself.
+    @discardableResult
+    func move(_ node: BookmarkNode, to folder: BookmarkNode, at index: Int? = nil) -> Bool {
+        guard !isRoot(node), folder.isFolder, !node.contains(folder) else { return false }
+        var target = index
+        if let old = node.parent {
+            if old === folder, let from = old.children.firstIndex(where: { $0 === node }), let t = target, from < t { target = t - 1 }
+            old.removeChild(node)
+        }
+        folder.insert(node, at: target)
         saveBookmarks()
         return true
     }
 
-    func removeBookmark(at index: Int) {
-        guard bookmarks.indices.contains(index) else { return }
-        bookmarks.remove(at: index)
+    func remove(_ nodes: [BookmarkNode]) {
+        let removable = nodes.filter { !isRoot($0) }
+        guard !removable.isEmpty else { return }
+        removable.forEach { $0.parent?.removeChild($0) }
         saveBookmarks()
+    }
+
+    func rename(_ node: BookmarkNode, to title: String) {
+        guard !isRoot(node) else { return }
+        let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        node.title = clean.isEmpty ? (node.isFolder ? "New Folder" : node.url.flatMap { URL(string: $0)?.host } ?? node.url ?? "") : clean
+        saveBookmarks()
+    }
+
+    /// ⌘D before the bubble existed, and the tests' shorthand: bookmark the page, or remove
+    /// every bookmark of it.
+    func toggleBookmark(url: URL, title: String) -> Bool {
+        if let nodes = bookmarkNodes[url.absoluteString] { remove(nodes); return false }
+        addBookmark(url: url, title: title)
+        return true
     }
 
     func removeBookmarks(urls: Set<String>) {
-        guard !urls.isEmpty else { return }
-        bookmarks.removeAll { urls.contains($0.url) }
-        saveBookmarks()
+        remove(urls.flatMap { bookmarkNodes[$0] ?? [] })
     }
 
     func renameBookmark(url: String, title: String) {
-        guard let i = bookmarks.firstIndex(where: { $0.url == url }) else { return }
-        let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        bookmarks[i].title = clean.isEmpty ? (URL(string: url)?.host ?? url) : clean
-        saveBookmarks()
+        guard let node = bookmarkNodes[url]?.first else { return }
+        rename(node, to: title)
     }
 
-    func moveBookmark(from: Int, to: Int) {
-        guard bookmarks.indices.contains(from), bookmarks.indices.contains(to), from != to else { return }
-        bookmarks.insert(bookmarks.remove(at: from), at: to)
-        saveBookmarks()
-    }
-
-    private func saveBookmarks() {
-        write(bookmarks, to: bookmarksURL)
-        NotificationCenter.default.post(name: .facetBookmarksChanged, object: nil)
-    }
-
-    /// Merge imported bookmarks by URL. Facet's existing title is preserved unless blank.
+    /// Merge imported bookmarks by URL, keeping the folders they came from: bar items onto the
+    /// bar, the rest under Other Bookmarks, folders merged by name. A URL Facet already has
+    /// keeps its place, and its title unless that is blank.
     @discardableResult
-    func importBookmarks(_ entries: [HistoryEntry]) -> Int {
-        var byURL: [String: Int] = [:]
-        for (i, e) in bookmarks.enumerated() { byURL[e.url] = i }
+    func importBookmarks(_ entries: [ImportedBookmark]) -> Int {
         var added = 0
         for e in entries {
             guard let u = URL(string: e.url), let scheme = u.scheme?.lowercased(), scheme == "http" || scheme == "https" else { continue }
-            if let i = byURL[e.url] {
-                if bookmarks[i].title.isEmpty && !e.title.isEmpty { bookmarks[i].title = e.title }
-            } else {
-                bookmarks.append(HistoryEntry(url: e.url, title: e.title.isEmpty ? u.host ?? "" : e.title,
-                                              visits: 1, lastVisit: e.lastVisit))
-                byURL[e.url] = bookmarks.count - 1
-                added += 1
+            if let existing = bookmarkNodes[e.url]?.first {
+                if existing.title.isEmpty && !e.title.isEmpty { existing.title = e.title }
+                continue
             }
+            var folder = e.root == .bar ? bookmarkBar : otherBookmarks
+            for name in e.folders {
+                if let match = folder.children.first(where: { $0.isFolder && $0.title == name }) { folder = match }
+                else { let f = BookmarkNode(title: name); folder.insert(f, at: nil); folder = f }
+            }
+            let node = BookmarkNode(title: e.title.isEmpty ? (u.host ?? e.url) : e.title, url: e.url, added: e.added)
+            folder.insert(node, at: nil)
+            bookmarkNodes[e.url] = [node]
+            added += 1
         }
         if !entries.isEmpty { saveBookmarks() }
         return added
+    }
+
+    private func reindexBookmarks() {
+        let all = bookmarkRoots.flatMap(\.allBookmarks)
+        bookmarkNodes = Dictionary(grouping: all, by: { $0.url ?? "" })
+        var seen = Set<String>()
+        bookmarks = all.compactMap { n in
+            guard let url = n.url, seen.insert(url).inserted else { return nil }
+            return HistoryEntry(url: url, title: n.title, visits: 1, lastVisit: n.added)
+        }
+    }
+
+    private var bookmarkWrite: DispatchWorkItem?
+
+    /// Views update at once; the file is written half a second later, so a burst of edits (a
+    /// drag of many items, a big import) writes once.
+    private func saveBookmarks() {
+        reindexBookmarks()
+        NotificationCenter.default.post(name: .facetBookmarksChanged, object: nil)
+        bookmarkWrite?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.flushBookmarks() }
+        bookmarkWrite = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+    }
+
+    /// Writes pending bookmark changes now: at quit, and before the file is read back.
+    func flushBookmarks() {
+        guard let pending = bookmarkWrite else { return }
+        pending.cancel()
+        bookmarkWrite = nil
+        func encode(_ n: BookmarkNode) -> [String: Any] {
+            var d: [String: Any] = ["id": n.id.uuidString, "title": n.title, "added": n.added.timeIntervalSince1970]
+            if let url = n.url { d["url"] = url } else { d["children"] = n.children.map(encode) }
+            return d
+        }
+        var root: [String: Any] = ["version": 2, "bar": encode(bookmarkBar), "other": encode(otherBookmarks)]
+        if let lastFolderID { root["lastFolder"] = lastFolderID.uuidString }
+        if let data = try? JSONSerialization.data(withJSONObject: root) { try? data.write(to: bookmarksURL, options: .atomic) }
+    }
+
+    /// Reads bookmarks.json again, replacing what is in memory.
+    func reloadBookmarks() {
+        flushBookmarks()
+        for root in bookmarkRoots { root.children.forEach { root.removeChild($0) } }
+        lastFolderID = nil
+        loadBookmarks()
+    }
+
+    /// Version 2 is a tree. Version 1 was a flat list, all of it shown on the bar, so it
+    /// becomes the bar's contents.
+    private func loadBookmarks() {
+        defer { reindexBookmarks() }
+        guard let data = try? Data(contentsOf: bookmarksURL), let json = try? JSONSerialization.jsonObject(with: data) else { return }
+        func decode(_ d: [String: Any]) -> BookmarkNode {
+            let url = d["url"] as? String
+            let node = BookmarkNode(id: (d["id"] as? String).flatMap(UUID.init(uuidString:)) ?? UUID(),
+                                    title: d["title"] as? String ?? "", url: url,
+                                    added: Date(timeIntervalSince1970: d["added"] as? Double ?? d["last"] as? Double ?? 0))
+            if url == nil { (d["children"] as? [[String: Any]] ?? []).forEach { node.insert(decode($0), at: nil) } }
+            return node
+        }
+        if let flat = json as? [[String: Any]] {
+            for d in flat where d["url"] is String { bookmarkBar.insert(decode(d), at: nil) }
+        } else if let root = json as? [String: Any] {
+            for (key, folder) in [("bar", bookmarkBar), ("other", otherBookmarks)] {
+                ((root[key] as? [String: Any])?["children"] as? [[String: Any]] ?? []).forEach { folder.insert(decode($0), at: nil) }
+            }
+            lastFolderID = (root["lastFolder"] as? String).flatMap(UUID.init(uuidString:))
+        }
     }
 
     // MARK: - Session
@@ -326,6 +507,7 @@ final class Store {
     // MARK: - Disk
 
     func flush() {
+        flushBookmarks()
         guard historyDirty else { return }
         historyDirty = false
         if history.count > maxHistory {

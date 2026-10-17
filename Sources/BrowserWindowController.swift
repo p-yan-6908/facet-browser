@@ -111,6 +111,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         startMemoryReadout()
 
         Downloads.shared.statusHandler = { [weak self] msg in self?.showStatus(msg) }
+        // The star follows bookmark changes made anywhere: the bubble, the bar, the manager.
+        observers.append(NotificationCenter.default.addObserver(forName: .facetBookmarksChanged, object: nil, queue: .main) { [weak self] _ in
+            self?.refreshChrome()
+        })
         observers.append(NotificationCenter.default.addObserver(forName: .facetDownloadsChanged, object: nil, queue: .main) { [weak self] _ in
             self?.refreshDownloadsButton()
         })
@@ -149,6 +153,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
             guard let self else { return }
             if inNewTab { self.newTab(url: url, activate: false).ensureLoaded() } else { self.open(url) }
         }
+        bookmarksBar.onOpenAll = { folder, newWindow in AppDelegate.shared?.openBookmarks(in: folder, newWindow: newWindow) }
         bookmarksBar.onOpenInNewWindow = { [weak self] url in
             guard let self else { return }
             AppDelegate.shared?.openInNewWindow(url, isPrivate: self.isPrivateWindow)
@@ -778,12 +783,16 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         showStatus(Config.shared.blockAdsAndTrackers ? "Blocking on" : "Blocking off")
     }
 
+    /// ⌘D and the star: bookmark the page at once, then show Chrome's bubble to name it, choose
+    /// its folder, or remove it. A page already bookmarked opens the same bubble to edit.
     @objc func toggleBookmark() {
         guard let tab = activeTab, let u = tab.url else { return }
-        let added = Store.shared.toggleBookmark(url: u, title: tab.title)
-        showStatus(added ? "Bookmarked" : "Bookmark removed")
-        refreshChrome()
-        AppDelegate.shared?.rebuildBookmarksMenu()
+        let existing = Store.shared.bookmark(for: u)
+        let node = existing ?? Store.shared.addBookmark(url: u, title: tab.title)
+        let editor = BookmarkEditorController(node: node, isNew: existing == nil)
+        editor.onFinish = { [weak self] in self?.transientPopover?.close() }
+        // Semitransient, so the New Folder prompt does not dismiss it.
+        present(editor, from: bookmarkButton.bounds, in: bookmarkButton, behavior: .semitransient)
     }
 
     @objc private func urlFieldCommitted() {
@@ -800,10 +809,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     private var transientPopover: NSPopover?
 
     /// One transient popover at a time; its content closes it when done.
-    private func present(_ controller: NSViewController, from rect: NSRect, in view: NSView) {
+    private func present(_ controller: NSViewController, from rect: NSRect, in view: NSView,
+                         behavior: NSPopover.Behavior = .transient) {
         transientPopover?.close()
         let popover = NSPopover()
-        popover.behavior = .transient
+        popover.behavior = behavior
         popover.contentViewController = controller
         popover.show(relativeTo: rect, of: view, preferredEdge: .maxY)
         transientPopover = popover

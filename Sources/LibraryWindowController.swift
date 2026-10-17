@@ -1,7 +1,7 @@
 import AppKit
 
-/// History (⌘Y) and Bookmarks (⌥⌘B) in one native window: search, open, delete, rename.
-/// Chrome draws these as web pages; a table view costs no renderer at all.
+/// History (⌘Y) and Bookmarks (⌥⌘B) in one native window: search, open, delete, and for
+/// bookmarks, folders. Chrome draws these as web pages; native views cost no renderer at all.
 final class LibraryWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate,
                                      NSSearchFieldDelegate, NSWindowDelegate {
     enum Mode: Int { case history = 0, bookmarks = 1 }
@@ -14,6 +14,8 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
     private let scroll = NSScrollView()
     private let deleteButton = NSButton(title: "Delete", target: nil, action: nil)
     private let clearButton = NSButton(title: "Clear Browsing Data\u{2026}", target: nil, action: nil)
+    private let newFolderButton = NSButton(title: "New Folder\u{2026}", target: nil, action: nil)
+    let bookmarkOutline = BookmarkOutline()
     private let countLabel = NSTextField(labelWithString: "")
     private(set) var rows: [HistoryEntry] = []
     private var bookmarkObserver: NSObjectProtocol?
@@ -80,11 +82,15 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
         deleteButton.action = #selector(deleteSelected)
         clearButton.target = AppDelegate.shared
         clearButton.action = #selector(AppDelegate.clearBrowsingData)
-        [deleteButton, clearButton].forEach { $0.bezelStyle = .rounded }
+        newFolderButton.target = self
+        newFolderButton.action = #selector(newFolder)
+        [deleteButton, clearButton, newFolderButton].forEach { $0.bezelStyle = .rounded }
+        bookmarkOutline.onOpen = { url, activate in AppDelegate.shared?.openInFrontWindow(url, activate: activate) }
+        let bookmarksScroll = bookmarkOutline.scroll
         countLabel.textColor = .secondaryLabelColor
         countLabel.font = .systemFont(ofSize: 11)
 
-        for v in [segmented, search, scroll, deleteButton, clearButton, countLabel] as [NSView] {
+        for v in [segmented, search, scroll, bookmarksScroll, deleteButton, clearButton, newFolderButton, countLabel] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(v)
         }
@@ -102,6 +108,12 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
             deleteButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
             clearButton.centerYAnchor.constraint(equalTo: deleteButton.centerYAnchor),
             clearButton.trailingAnchor.constraint(equalTo: deleteButton.leadingAnchor, constant: -8),
+            newFolderButton.centerYAnchor.constraint(equalTo: deleteButton.centerYAnchor),
+            newFolderButton.trailingAnchor.constraint(equalTo: deleteButton.leadingAnchor, constant: -8),
+            bookmarksScroll.topAnchor.constraint(equalTo: scroll.topAnchor),
+            bookmarksScroll.leadingAnchor.constraint(equalTo: scroll.leadingAnchor),
+            bookmarksScroll.trailingAnchor.constraint(equalTo: scroll.trailingAnchor),
+            bookmarksScroll.bottomAnchor.constraint(equalTo: scroll.bottomAnchor),
             countLabel.centerYAnchor.constraint(equalTo: deleteButton.centerYAnchor),
             countLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
         ])
@@ -125,6 +137,9 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
         window?.title = mode == .history ? "History" : "Bookmarks"
         table.tableColumns.first { $0.identifier.rawValue == "date" }?.title = mode == .history ? "Visited" : "Added"
         clearButton.isHidden = mode != .history
+        newFolderButton.isHidden = mode != .bookmarks
+        scroll.isHidden = mode != .history
+        bookmarkOutline.scroll.isHidden = mode != .bookmarks
         reload()
     }
 
@@ -132,16 +147,20 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
     func controlTextDidChange(_ obj: Notification) { reload() }
 
     func reload() {
+        if mode == .bookmarks {
+            bookmarkOutline.reload(query: search.stringValue)
+            countLabel.stringValue = bookmarkOutline.countText
+            deleteButton.isEnabled = true
+            return
+        }
         let q = search.stringValue.trimmingCharacters(in: .whitespaces).lowercased()
-        let source = mode == .history
-            ? Store.shared.history.sorted { $0.lastVisit > $1.lastVisit }
-            : Store.shared.bookmarks
+        let source = Store.shared.history.sorted { $0.lastVisit > $1.lastVisit }
         let filtered = q.isEmpty ? source : source.filter {
             $0.title.lowercased().contains(q) || $0.url.lowercased().contains(q)
         }
         rows = Array(filtered.prefix(5_000))
         table.reloadData()
-        let noun = mode == .history ? (rows.count == 1 ? "page" : "pages") : (rows.count == 1 ? "bookmark" : "bookmarks")
+        let noun = rows.count == 1 ? "page" : "pages"
         countLabel.stringValue = "\(rows.count) \(noun)" + (filtered.count > rows.count ? " (showing first \(rows.count))" : "")
         deleteButton.isEnabled = !rows.isEmpty
     }
@@ -158,7 +177,6 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
         switch id.rawValue {
         case "title":
             cell.textField?.stringValue = entry.title.isEmpty ? Store.displayForm(entry.url) : entry.title
-            cell.textField?.isEditable = mode == .bookmarks
             cell.imageView?.image = FaviconStore.shared.icon(forHost: URL(string: entry.url)?.host)
                 ?? NSImage(systemSymbolName: "globe", accessibilityDescription: nil)
         case "address":
@@ -175,8 +193,6 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
         let text = NSTextField(labelWithString: "")
         text.lineBreakMode = .byTruncatingTail
         text.translatesAutoresizingMaskIntoConstraints = false
-        text.target = self
-        text.action = #selector(titleEdited(_:))
         cell.addSubview(text)
         cell.textField = text
         if id.rawValue == "title" {
@@ -202,11 +218,7 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
         return cell
     }
 
-    @objc private func titleEdited(_ sender: NSTextField) {
-        let row = table.row(for: sender)
-        guard mode == .bookmarks, rows.indices.contains(row) else { return }
-        Store.shared.renameBookmark(url: rows[row].url, title: sender.stringValue)
-    }
+    @objc private func newFolder() { bookmarkOutline.newFolder() }
 
     private var selectedEntries: [HistoryEntry] {
         var indexes = table.selectedRowIndexes
@@ -224,14 +236,11 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
     }
 
     @objc func deleteSelected() {
+        if mode == .bookmarks { bookmarkOutline.deleteSelected(); return }
         let urls = Set(selectedEntries.map(\.url))
         guard !urls.isEmpty else { return }
-        if mode == .history {
-            Store.shared.removeHistory(urls: urls)
-            AppDelegate.shared?.rebuildHistoryMenu()
-        } else {
-            Store.shared.removeBookmarks(urls: urls)
-        }
+        Store.shared.removeHistory(urls: urls)
+        AppDelegate.shared?.rebuildHistoryMenu()
         reload()
     }
 
@@ -244,9 +253,6 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(self.selectedEntries.map(\.url).joined(separator: "\n"), forType: .string)
         })
-        if mode == .bookmarks, let entry = selectedEntries.first, let url = URL(string: entry.url) {
-            menu.addItem(ClosureMenuItem("Rename\u{2026}") { BookmarkItemView.promptRename(url: url, title: entry.title) })
-        }
         menu.addItem(.separator())
         menu.addItem(ClosureMenuItem("Delete") { [weak self] in self?.deleteSelected() })
         return menu
