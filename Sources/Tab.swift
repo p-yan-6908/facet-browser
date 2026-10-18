@@ -66,6 +66,7 @@ enum WebKitEnv {
         cfg.defaultWebpagePreferences.allowsContentJavaScript = true
         ContentBlocker.install(in: cfg.userContentController)
         PageBridge.install(in: cfg.userContentController)
+        TypingTracker.install(in: cfg.userContentController)
         return cfg
     }
 }
@@ -124,6 +125,19 @@ final class Tab: NSObject {
     private var providedConfiguration: WKWebViewConfiguration?
     private var webKitWillLoad = false
     private var observations: [NSKeyValueObservation] = []
+
+    /// What each frame of the current page reported about typing. Reset when a page commits.
+    private var frameTyping: [String: FrameTyping] = [:]
+    private var typingGeneration = 0
+    private var mainFrameWatchesSaves = false
+    /// The page warned about leaving; its typing counts as unsaved until it saves again.
+    private var warnedThroughSave: Double?
+    /// More typed text than Facet keeps for a sleeping tab.
+    private var fieldsTooBig = false
+    private var isPreparingSleep = false
+    /// Form fields typed into before the tab slept, put back when the same page loads again.
+    private(set) var keptFields: [[String: Any]]?
+    private var keptFieldsURL: URL?
 
     /// Replaced in tests. The default asks with a native sign-in sheet.
     static var credentialPrompt: (URLProtectionSpace, Int, NSWindow?, @escaping (URLCredential?) -> Void) -> Void
@@ -240,8 +254,124 @@ final class Tab: NSObject {
 
     /// Budget eviction is allowed only for ordinary background pages.
     var canHibernateForBudget: Bool {
-        guard webView != nil, !keepAwake, !isAgentLeased else { return false }
+        guard webView != nil, !keepAwake, !isAgentLeased, !hasUnsavedTyping else { return false }
         return !isPlayingMedia
+    }
+
+    // MARK: - Typing
+
+    /// The user has typed into this page since it loaded.
+    var hasTyped: Bool { frameTyping.values.contains { $0.typed } }
+
+    /// Typing only the page can keep, not saved yet. The tab stays awake until it is.
+    var hasUnsavedTyping: Bool {
+        fieldsTooBig || UnsavedTyping.isUnsaved(Array(frameTyping.values), warnedThroughSave: warnedThroughSave)
+    }
+
+    /// Frames the tracker was put into, for tests.
+    private(set) var trackedFrameCount = 0
+
+    func handleTypingMessage(_ body: [String: Any], fromMainFrame: Bool) {
+        if body["t"] as? String == "frameFocus" { trackFocusedFrame(); return }
+        guard let (id, frame) = UnsavedTyping.parse(body) else { return }
+        guard let frame else { frameTyping[id] = nil; return }
+        guard frameTyping[id] != nil || frameTyping.count < 64 else { return }
+        frameTyping[id] = frame
+        // Editors like Google Docs type into a frame and save from the page, so the page
+        // starts watching for saves too.
+        if !fromMainFrame, frame.typed, !mainFrameWatchesSaves, let wv = webView {
+            mainFrameWatchesSaves = true
+            wv.evaluateJavaScript("window.__facetTyping && window.__facetTyping.watch(); 0",
+                                  in: nil, in: .defaultClient, completionHandler: { _ in })
+        }
+    }
+
+    /// Puts the tracker into the frame that just took focus. Finding it needs WebKit's frame
+    /// tree, which is SPI; without it typing in frames goes unnoticed, as before.
+    func trackFocusedFrame() {
+        let framesSelector = NSSelectorFromString("_frames:")
+        guard let wv = webView, wv.responds(to: framesSelector) else { return }
+        let generation = typingGeneration
+        let found: @convention(block) (AnyObject?) -> Void = { [weak self, weak wv] root in
+            guard let self, let wv, self.webView === wv, self.typingGeneration == generation,
+                  let root, let frame = Self.focusedSubframe(in: root) else { return }
+            wv.evaluateJavaScript(UnsavedTyping.trackerJS + "\n0", in: frame, in: .defaultClient) { [weak self] result in
+                if case .success = result { self?.trackedFrameCount += 1 }
+            }
+        }
+        wv.perform(framesSelector, with: unsafeBitCast(found, to: AnyObject.self))
+    }
+
+    private static func focusedSubframe(in node: AnyObject) -> WKFrameInfo? {
+        guard let info = node.value(forKey: "info") as? WKFrameInfo else { return nil }
+        if !info.isMainFrame, info.responds(to: NSSelectorFromString("_isFocused")),
+           info.value(forKey: "_isFocused") as? Bool == true { return info }
+        for child in node.value(forKey: "childFrames") as? [AnyObject] ?? [] {
+            if let focused = focusedSubframe(in: child) { return focused }
+        }
+        return nil
+    }
+
+    private func resetTyping() {
+        frameTyping.removeAll()
+        typingGeneration += 1
+        mainFrameWatchesSaves = false
+        warnedThroughSave = nil
+        fieldsTooBig = false
+    }
+
+    /// Puts the tab to sleep without losing what the user typed. Typed form fields are kept
+    /// and put back when the tab wakes; a page whose editor hasn't saved, or that warns about
+    /// leaving, stays awake. Untyped tabs sleep at once, exactly as `hibernate()`.
+    /// `stillAllowed` is asked again once the page has answered, since that is asynchronous.
+    /// `overridingKeepAwake` is for an explicit request (the Task Manager's Sleep Tab), which
+    /// may sleep a tab kept awake or playing media, but never one with unsaved typing.
+    func sleep(overridingKeepAwake: Bool = false, if stillAllowed: @escaping () -> Bool = { true },
+               completion: ((Bool) -> Void)? = nil) {
+        guard maySleep(overridingKeepAwake: overridingKeepAwake), let wv = webView else { completion?(false); return }
+        guard hasTyped else { hibernate(); completion?(true); return }
+        guard !isPreparingSleep else { completion?(false); return }
+        isPreparingSleep = true
+        let generation = typingGeneration
+        let probe = frameTyping.values.contains { $0.editAt > 0 }
+        wv.callAsyncJavaScript(UnsavedTyping.prepareJS, arguments: ["probe": probe], in: nil, in: .defaultClient) { [weak self] result in
+            guard let self else { completion?(false); return }
+            self.isPreparingSleep = false
+            guard case .success(let value) = result, let answer = value as? [String: Any],
+                  self.webView === wv, self.typingGeneration == generation,
+                  self.maySleep(overridingKeepAwake: overridingKeepAwake), stillAllowed() else { completion?(false); return }
+            if answer["warns"] as? Bool == true {
+                self.warnedThroughSave = self.frameTyping.values.map(\.saveAt).max() ?? 0
+                completion?(false); return
+            }
+            if answer["tooBig"] as? Bool == true { self.fieldsTooBig = true; completion?(false); return }
+            let fields = answer["fields"] as? [[String: Any]] ?? []
+            self.hibernate()
+            if !fields.isEmpty { self.keptFields = fields; self.keptFieldsURL = self.url }
+            completion?(true)
+        }
+    }
+
+    private func maySleep(overridingKeepAwake: Bool) -> Bool {
+        guard overridingKeepAwake else { return canHibernateForBudget }
+        return webView != nil && !isAgentLeased && !hasUnsavedTyping
+    }
+
+    /// Fills kept form fields back in once the page they came from has loaded again.
+    private func restoreKeptFields(in webView: WKWebView) {
+        guard let fields = keptFields, let page = webView.url, let kept = keptFieldsURL,
+              UnsavedTyping.samePage(page, kept) else { return }
+        keptFields = nil
+        webView.callAsyncJavaScript(UnsavedTyping.restoreJS, arguments: ["fields": fields], in: nil, in: .defaultClient) { [weak self] result in
+            guard let self, self.keptFields == nil else { return }
+            // Fields the page never built stay kept for its next load.
+            let missing: [[String: Any]]
+            switch result {
+            case .success(let value): missing = (value as? [String: Any])?["missing"] as? [[String: Any]] ?? []
+            case .failure: missing = fields
+            }
+            if !missing.isEmpty { self.keptFields = missing; self.keptFieldsURL = kept }
+        }
     }
 
     /// The WebKit content process rendering this tab, or nil while it sleeps. WebKit only
@@ -256,11 +386,15 @@ final class Tab: NSObject {
     var hoverDescription: String {
         let site = url?.host ?? ""
         var cost = ""
-        if isHibernated { cost = hasEverLoaded || url != nil ? "asleep, using no memory" : "" }
-        else if let pid = webProcessID {
+        var note = ""
+        if isHibernated {
+            cost = hasEverLoaded || url != nil ? "asleep, using no memory" : ""
+            if keptFields != nil { note = "your typing is kept" }
+        } else if let pid = webProcessID {
             cost = ByteCountFormatter.string(fromByteCount: Int64(MemoryMonitor.footprint(of: pid)), countStyle: .memory)
         }
-        let detail = [site, cost].filter { !$0.isEmpty }.joined(separator: " \u{00B7} ")
+        if !isHibernated && hasUnsavedTyping { note = "awake to keep unsaved typing" }
+        let detail = [site, cost, note].filter { !$0.isEmpty }.joined(separator: " \u{00B7} ")
         return detail.isEmpty ? displayTitle : "\(displayTitle)\n\(detail)"
     }
 
@@ -1037,6 +1171,7 @@ extension Tab: WKNavigationDelegate {
         if navigation == nil || navigation !== errorNavigation { errorURL = nil; errorNavigation = nil }
         dialogCount = 0
         dialogsSuppressed = false
+        resetTyping()
         applySiteZoom(webView)
         if hoveredLink != nil { hoveredLink = nil; delegate?.tab(self, didHoverLink: nil) }
         delegate?.tabDidChangeState(self)
@@ -1051,6 +1186,7 @@ extension Tab: WKNavigationDelegate {
             fetchFavicon(for: webView)
             refreshSemanticCache(in: webView)
             autofillSavedLogin(in: webView)
+            restoreKeptFields(in: webView)
         }
         delegate?.tabDidChangeState(self)
     }

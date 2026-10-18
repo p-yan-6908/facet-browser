@@ -45,13 +45,16 @@ enum TaskManager {
         if tab === window.activeTab && window.isContentVisible { return "On screen" }
         if tab.isAgentLeased { return "In use by agent" }
         if tab.isPlayingAudio { return "Playing audio" }
+        if tab.hasUnsavedTyping { return "Unsaved typing" }
         if tab.keepAwake { return "Kept awake" }
         return "Background"
     }
 
-    /// Sleeping is refused only for the page someone is looking at and for agent work.
+    /// Sleeping is refused only for the page someone is looking at, for agent work, and for
+    /// typing the page hasn't saved yet.
     static func canSleep(_ row: TaskManagerRow) -> Bool {
-        guard let tab = row.tab, let window = row.window, !tab.isHibernated, !tab.isAgentLeased else { return false }
+        guard let tab = row.tab, let window = row.window, !tab.isHibernated, !tab.isAgentLeased,
+              !tab.hasUnsavedTyping else { return false }
         return !(tab === window.activeTab && window.isContentVisible)
     }
 }
@@ -172,8 +175,11 @@ final class TaskManagerWindowController: NSWindowController, NSWindowDelegate, N
 
     @objc func sleepSelected() {
         for row in selectedRows where TaskManager.canSleep(row) {
-            row.tab?.hibernate()
-            row.window?.refreshChrome()
+            guard let tab = row.tab, let window = row.window else { continue }
+            tab.sleep(overridingKeepAwake: true, if: { !(tab === window.activeTab && window.isContentVisible) }) { [weak self] _ in
+                window.refreshChrome()
+                self?.reload()
+            }
         }
         reload()
     }

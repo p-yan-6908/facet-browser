@@ -82,6 +82,7 @@ struct PolishTests {
         try bookmarkFolders(root)
         try otherBrowserSessions(root)
         try passwords(root)
+        typingDecisions()
         if CommandLine.arguments.contains("--webkit") {
             try webKitPrivacy(); assistantSidebarUI(); try cookieStoreRoundTrip(); sessionImportConsentUI(root)
             try browserFeaturesWebKit(root)
@@ -90,6 +91,7 @@ struct PolishTests {
             bookmarkUI()
             importOfferUI(root)
             try passwordAutofillWebKit()
+            try typingSleepWebKit()
         }
         else { print("SKIP: WebKit UI probes (run with --webkit in a macOS GUI session)") }
         print("\(checks - failures.count)/\(checks) checks passed")

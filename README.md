@@ -107,6 +107,17 @@ time, and wakes it the moment the window is visible again. When macOS kills a ba
 renderer to reclaim memory, Facet leaves that tab asleep instead of instantly reloading it
 and spending the memory the system just asked for.
 
+Sleeping never throws away what you typed. Text typed into ordinary form fields is kept
+(a few KB) and put back when the tab wakes, so a half-filled form still sleeps and frees
+its renderer. Typing that only the page can keep — rich editors, fields inside frames —
+keeps the tab awake until the page has saved it: its own site has sent a request since
+your last keystroke (analytics and other sites' requests don't count) and it doesn't warn
+about leaving. Google Docs, Notion and Gmail drafts save within seconds, so their tabs
+sleep normally; an editor that never saves stays awake until you leave the page. Facet
+only counts real keystrokes, never script-made events, and never keeps passwords, card
+numbers or one-time codes. The tracker runs in the page's own isolated world and goes into
+a frame only when you click into it, so pages full of frames pay nothing for it.
+
 **3. Ad and tracker blocking in the network layer.** 214 domain rules are compiled
 once into a WebKit bytecode program that runs inside the networking process, so
 blocked requests never reach the renderer at all. This is cheaper *and* stronger
@@ -457,6 +468,7 @@ a throwaway profile folder instead.
 | `Sources/Controls.swift` | toolbar buttons (with history menus), address bar, status pill, link status |
 | `Sources/Omnibox.swift` | address-bar ranking, inline completion, dropdown |
 | `Sources/WebView.swift` | isolated-world page bridge, context-menu hook, closure menu items |
+| `Sources/UnsavedTyping.swift` | typing tracker, kept form fields, the stay-awake-until-saved decision |
 | `Sources/Downloads.swift` / `DownloadsView.swift` | download tracking, quarantine, toolbar popover |
 | `Sources/BookmarksBar.swift` | bookmarks bar, folder menus, shared bookmark prompts |
 | `Sources/BookmarkEditor.swift` | the ⌘D bubble: name, folder, remove |

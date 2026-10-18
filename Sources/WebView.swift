@@ -61,6 +61,16 @@ final class PageBridge: NSObject, WKScriptMessageHandler {
 final class FacetWebView: WKWebView {
     weak var owner: Tab?
 
+    override func becomeFirstResponder() -> Bool {
+        let became = super.becomeFirstResponder()
+        // A page that focused one of its frames while in the background (Google Docs does)
+        // never sees focus leave for it, so check which frame has focus once the click lands.
+        if became {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in self?.owner?.trackFocusedFrame() }
+        }
+        return became
+    }
+
     override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
         super.willOpenMenu(menu, with: event)
         owner?.customizeContextMenu(menu)

@@ -214,7 +214,9 @@ final class BrowserAgentSession {
     private func release(_ tab: Tab) {
         guard let lease = leases.removeValue(forKey: tab.id) else { return }
         tab.releaseAgentLease()
-        if lease.wasSleeping && !isActive(tab) && tab.canHibernateForBudget { tab.hibernate() }
+        if lease.wasSleeping && !isActive(tab) && tab.canHibernateForBudget {
+            tab.sleep(if: { [weak self] in !(self?.isActive(tab) ?? false) })
+        }
     }
 
     private func withLeasedTab(_ id: String, completion: @escaping (Result<String, Error>) -> Void,

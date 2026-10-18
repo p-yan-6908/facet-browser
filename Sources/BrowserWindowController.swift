@@ -771,14 +771,13 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func reloadAllForRuleChange() {
-        // Content rules are baked into a configuration at creation time, so tabs must
-        // be rebuilt. Hibernating them does exactly that, for free.
-        for (i, tab) in tabs.enumerated() where i != activeIndex { tab.hibernate() }
-        if let tab = activeTab {
-            tab.webView?.removeFromSuperview()
-            tab.hibernate()
-            attachActiveTab()
+        // The new rules go into every live page; sleeping tabs pick them up when they wake.
+        // Only the page on screen reloads to show the change, and not while it holds typing.
+        for tab in tabs {
+            guard let wv = tab.webView else { continue }
+            ContentBlocker.install(in: wv.configuration.userContentController)
         }
+        if let tab = activeTab, let wv = tab.webView, !tab.hasTyped { wv.reload() }
         refreshChrome()
         showStatus(Config.shared.blockAdsAndTrackers ? "Blocking on" : "Blocking off")
     }
@@ -1041,31 +1040,54 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
 
     private func hibernateIdleTabs() {
         let threshold = Config.shared.hibernateAfterMinutes * 60
-        var slept = 0
         for (i, tab) in tabs.enumerated() {
             if i == activeIndex {
                 // The page on screen never sleeps; the one in a window nobody can see may.
                 guard let since = hiddenSince, !isContentVisible,
                       Date().timeIntervalSince(since) >= threshold, tab.canHibernateForBudget else { continue }
-                tab.hibernate(); slept += 1
+                tab.sleep(if: { [weak self] in self.map { !$0.isContentVisible || $0.activeTab !== tab } ?? false }) { [weak self] slept in
+                    if slept { self?.tabsDidSleep() }
+                }
             } else if tab.canHibernate(idleFor: threshold) {
-                tab.hibernate(); slept += 1
+                tab.sleep(if: { [weak self] in self?.activeTab !== tab }) { [weak self] slept in
+                    if slept { self?.tabsDidSleep() }
+                }
             }
-        }
-        if slept > 0 {
-            refreshChrome()
-            saveSessionNow()
         }
     }
 
-    /// Menu action: put every background tab to sleep right now.
-    @objc func hibernateBackgroundTabsNow() {
-        var slept = 0
-        for (i, tab) in tabs.enumerated() where i != activeIndex {
-            if tab.canHibernateForBudget { tab.hibernate(); slept += 1 }
+    private var sleepRefreshScheduled = false
+
+    /// One chrome refresh and session save for a batch of sleeps, some finishing later.
+    private func tabsDidSleep() {
+        guard !sleepRefreshScheduled else { return }
+        sleepRefreshScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.sleepRefreshScheduled = false
+            self.refreshChrome()
+            self.saveSessionNow()
         }
-        refreshChrome()
-        showStatus(slept == 0 ? "Nothing to sleep" : "Slept \(slept) tab\(slept == 1 ? "" : "s")")
+    }
+
+    /// Menu action: put every background tab to sleep right now, except those whose typing
+    /// isn't saved yet.
+    @objc func hibernateBackgroundTabsNow() {
+        var slept = 0, kept = 0
+        let group = DispatchGroup()
+        for (i, tab) in tabs.enumerated() where i != activeIndex && !tab.isHibernated {
+            if tab.hasUnsavedTyping { kept += 1; continue }
+            guard tab.canHibernateForBudget else { continue }
+            group.enter()
+            tab.sleep(if: { [weak self] in self?.activeTab !== tab }) { ok in
+                if ok { slept += 1 } else if tab.hasUnsavedTyping { kept += 1 }
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) { [weak self] in
+            self?.refreshChrome()
+            self?.showStatus(UnsavedTyping.sleepSummary(slept: slept, kept: kept))
+        }
     }
 
     // MARK: - Memory readout
@@ -1346,9 +1368,13 @@ extension BrowserWindowController: TabStripDelegate {
                 guard let self else { return }
                 // Never tear down the tab currently on screen.
                 if tab === self.activeTab { self.showStatus("Can\u{2019}t sleep the active tab"); return }
+                let unsaved = "Kept awake: its typing isn\u{2019}t saved yet"
+                if tab.hasUnsavedTyping { self.showStatus(unsaved); return }
                 if !tab.canHibernateForBudget { self.showStatus("Tab is protected or playing media"); return }
-                tab.hibernate()
-                self.refreshChrome()
+                tab.sleep(if: { [weak self] in self?.activeTab !== tab }) { [weak self] slept in
+                    self?.refreshChrome()
+                    if !slept && tab.hasUnsavedTyping { self?.showStatus(unsaved) }
+                }
             }))
         }
         if tabs.count > 1 {

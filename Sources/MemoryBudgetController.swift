@@ -99,8 +99,12 @@ final class MemoryBudgetController {
         let perTab = max(1, estimator.conservativeReclaimBytes)
         let count = max(1, Int((need + perTab - 1) / perTab))
         let victims = evictionCandidates(excluding: tab)
-        for victim in victims.prefix(min(count, victims.count)) { victim.hibernate() }
-        if !victims.isEmpty { invalidateSample(); refreshAllWindows() }
+        for victim in victims.prefix(min(count, victims.count)) {
+            // Tabs with typing answer asynchronously, so their memory frees a moment later.
+            victim.sleep(if: { [weak self] in !(self?.isOnScreen(victim) ?? true) }) { [weak self] slept in
+                if slept { self?.invalidateSample(); self?.scheduleRefresh() }
+            }
+        }
     }
 
     func enforceBudget(reason: String) {
@@ -125,9 +129,16 @@ final class MemoryBudgetController {
         guard tab.canHibernateForBudget else {
             reclaimOneByOne(candidates, index: index + 1, before: before, reason: reason); return
         }
-        tab.hibernate()
-        invalidateSample(); refreshAllWindows()
+        tab.sleep(if: { [weak self] in !(self?.isOnScreen(tab) ?? true) }) { [weak self] slept in
+            guard let self else { return }
+            // A tab kept awake for its typing frees nothing; try the next without measuring.
+            guard slept else { self.reclaimOneByOne(candidates, index: index + 1, before: before, reason: reason); return }
+            self.invalidateSample(); self.refreshAllWindows()
+            self.measureReclaim(candidates, index: index, before: before, reason: reason)
+        }
+    }
 
+    private func measureReclaim(_ candidates: [Tab], index: Int, before: UInt64, reason: String) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) { [weak self] in
             guard let self else { return }
             let after = self.sample(maxAge: 0).totalBytes
@@ -153,9 +164,30 @@ final class MemoryBudgetController {
     /// tabs are preserved; everything else in the background is eligible immediately.
     func handleMemoryPressure() {
         NSLog("Facet: memory pressure, reclaiming background tabs")
-        for tab in evictionCandidates(excluding: nil) { tab.hibernate() }
+        for tab in evictionCandidates(excluding: nil) {
+            tab.sleep(if: { [weak self] in !(self?.isOnScreen(tab) ?? true) }) { [weak self] slept in
+                if slept { self?.invalidateSample(); self?.scheduleRefresh() }
+            }
+        }
         URLCache.shared.removeAllCachedResponses()
-        invalidateSample(); refreshAllWindows()
+        scheduleRefresh()
+    }
+
+    private var refreshScheduled = false
+
+    /// One refresh for a burst of sleeps, some of which finish asynchronously.
+    private func scheduleRefresh() {
+        guard !refreshScheduled else { return }
+        refreshScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.refreshScheduled = false
+            self.invalidateSample(); self.refreshAllWindows()
+        }
+    }
+
+    private func isOnScreen(_ tab: Tab) -> Bool {
+        windows.allObjects.contains { $0.activeTab === tab && $0.isContentVisible }
     }
 
     private func evictionCandidates(excluding: Tab?) -> [Tab] {
@@ -168,7 +200,8 @@ final class MemoryBudgetController {
                 if tab.canHibernateForBudget { result.append(tab) }
             }
         }
-        return result.sorted { $0.lastActive < $1.lastActive }
+        // Least recently used first; tabs with typing last, since they may need to stay awake.
+        return result.sorted { ($0.hasTyped ? 1 : 0, $0.lastActive) < ($1.hasTyped ? 1 : 0, $1.lastActive) }
     }
 
     private func refreshAllWindows() {
