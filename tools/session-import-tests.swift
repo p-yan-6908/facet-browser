@@ -87,8 +87,9 @@ extension PolishTests {
         for r in records { page += (0..<4).map { UInt8((offset >> (8 * $0)) & 0xff) }; offset += r.count }
         page += [0, 0, 0, 0] + records.flatMap { $0 }
         let size = page.count
-        let file = Array("cook".utf8) + [0, 0, 0, 1] + [UInt8(size >> 24 & 0xff), UInt8(size >> 16 & 0xff), UInt8(size >> 8 & 0xff), UInt8(size & 0xff)]
-            + page + [UInt8](repeating: 0, count: 8)
+        var file = Array("cook".utf8) + [0, 0, 0, 1]
+        file += [UInt8(size >> 24 & 0xff), UInt8(size >> 16 & 0xff), UInt8(size >> 8 & 0xff), UInt8(size & 0xff)]
+        file += page + [UInt8](repeating: 0, count: 8)
         let cookieFile = root.appendingPathComponent("Cookies.binarycookies")
         try Data(file).write(to: cookieFile)
         let safari = BrowserImportSource(id: "safari-sessions", browserName: "Safari", profileName: "Default", profileURL: root,
